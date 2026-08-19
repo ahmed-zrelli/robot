@@ -99,10 +99,43 @@ Four detection layers:
 
 Checks 2 and 3 require 3 consecutive anomalous samples before firing
 "new", and 3 consecutive normal samples before firing "cleared" —
-avoids flagging single-sample spikes. On connect, checks 1, 2, and 4
-warm-start their state from DB history (check 3 still starts cold each
-reconnect — not yet implemented). Baselines pool history across all
-past sessions; no per-robot/per-environment scoping yet.
+avoids flagging single-sample spikes.
+
+### How the 3-minute window and warm-up work
+
+- **Window:** each signal's baseline (`RollingStat`) only keeps samples
+  from the last `WINDOW_SECONDS = 180` (3 min), evicting anything older
+  relative to the newest sample. This is time-based, not a fixed sample
+  count — different topics publish at different rates, so a fixed count
+  would mean "recent" covers a different amount of real time per signal.
+  `MAX_SAMPLES = 900` is a separate safety cap on memory, not a
+  redefinition of "recent".
+- **Ready-to-judge threshold:** a signal isn't judged for anomalies
+  until it has at least `MIN_BASELINE_SAMPLES = 25` samples in its
+  window — this is a simple count floor, independent of the 3-minute
+  window.
+- **Warm-up on connect:** on every new connection, `db.recent_telemetry(topic, since, limit)`
+  pulls rows from `dashboard.db` where `recorded_at >= now - 180s`
+  (most recent first) and feeds them into the baseline *before* live
+  samples start arriving — so a signal can already be past the
+  25-sample floor at connect time instead of starting empty.
+- **Clock used:** warm-up and live ingestion both use wall-clock
+  `time.time()`, not the stream's own session-relative timestamp — this
+  matters because mixing the two would make old warm-up rows look
+  "recent" (or get evicted wrongly) depending on how the numeric ranges
+  happened to overlap.
+- **If there's no recent history:** warm-up simply seeds nothing if
+  nothing's been recorded in the last 3 minutes (first run, or a long
+  gap since the last session) — the signal just starts cold, same as
+  before warm-up existed.
+- **Pooling:** warm-up pools history across *all* past sessions/
+  connections, with no filtering by robot identity, terrain, or
+  conditions — there's no schema support for per-robot/per-environment
+  scoping yet.
+- **What's warmed up vs. not:** checks 1 (hardware faults), 2
+  (statistical), and 4 (GNSS) warm-start from DB history. Check 3
+  (velocity residual) still starts cold every reconnect — reconstructing
+  historical commanded/measured pairs in order wasn't built yet.
 
 **Not yet handled:** a real maneuver (acceleration/turning) can produce
 the same kind of correlated multi-signal shift as a real fault — the
