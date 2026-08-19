@@ -1,0 +1,42 @@
+{
+  "duration_s": 12757.618033224,
+  "topics": {
+    "/left/rear/feedback": "left_rear_feedback.json",
+    "/left/front/feedback": "left_front_feedback.json",
+    "/battery/state": "battery_state.json",
+    "/left/front/cmd": "left_front_cmd.json",
+    "/left/rear/cmd": "left_rear_cmd.json",
+    "/coil_outputs": "coil_outputs.json",
+    "/charging": "charging.json",
+    "/right/rear/feedback": "right_rear_feedback.json",
+    "/ublox/gnss_fix": "ublox_gnss_fix.json",
+    "/ublox/gnss_status": "ublox_gnss_status.json",
+    "/ublox/rtk_correction": "ublox_rtk_correction.json",
+    "/left_roboteq_driver/status": "left_roboteq_driver_status.json",
+    "/right/front/feedback": "right_front_feedback.json",
+    "/nmea_sentence": "nmea_sentence.json",
+    "/right_roboteq_driver/status": "right_roboteq_driver_status.json",
+    "/right/front/cmd": "right_front_cmd.json",
+    "/right/rear/cmd": "right_rear_cmd.json"
+  },
+  "topic_msgtype": {
+    "/left/rear/feedback": "roboteq_msgs/msg/Feedback",
+    "/left/front/feedback": "roboteq_msgs/msg/Feedback",
+    "/battery/state": "sensor_msgs/msg/BatteryState",
+    "/left/front/cmd": "roboteq_msgs/msg/Command",
+    "/left/rear/cmd": "roboteq_msgs/msg/Command",
+    "/coil_outputs": "std_msgs/msg/Int32MultiArray",
+    "/charging": "std_msgs/msg/Bool",
+    "/right/rear/feedback": "roboteq_msgs/msg/Feedback",
+    "/ublox/gnss_fix": "enova_msgs/msg/GnssFix",
+    "/ublox/gnss_status": "enova_msgs/msg/GnssStatus",
+    "/ublox/rtk_correction": "std_msgs/msg/Bool",
+    "/left_roboteq_driver/status": "roboteq_msgs/msg/Status",
+    "/right/front/feedback": "roboteq_msgs/msg/Feedback",
+    "/nmea_sentence": "nmea_msgs/msg/Sentence",
+    "/right_roboteq_driver/status": "roboteq_msgs/msg/Status",
+    "/right/front/cmd": "roboteq_msgs/msg/Command",
+    "/right/rear/cmd": "roboteq_msgs/msg/Command"
+  },
+  "skipped_topics": []
+}

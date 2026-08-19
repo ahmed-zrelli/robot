@@ -1,0 +1,8 @@
+services:
+  virtual-robot:
+    build: ./virtual_robot
+    ports:
+      - "9090:9090"
+      - "2222:22"
+    volumes:
+      - ./bag:/bag:ro
