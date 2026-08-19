@@ -1,215 +1,237 @@
-# Outdoor Robot Monitor
+# Outdoor Robot Monitor — V0
 
-A monitoring-only dashboard for an outdoor robot — battery, motors,
-GPS, and automated health/fault detection, built ahead of having
-direct access to the real robot. "V0" = first working version; no
-robot commands or control, read-only telemetry only.
+Monitoring-only dashboard prototype. No live robot yet, so it replays a
+recorded rosbag over a WebSocket as if it were live telemetry. Swapping the
+replay source for a real ROS2/rosbridge subscriber later only touches
+`backend/main.py` — the frontend and wire format
+(`{type:'msg', topic, t, data}`) don't change.
 
-## Overview
+## Run it
 
-Three pieces:
-
-- **Backend** (`backend/`) — a Python server that gets robot telemetry
-  from one of two sources (see below), stores it in a local database,
-  runs it through health checks, and streams it to the browser over a
-  WebSocket as `{type:'msg', topic, t, data}` messages.
-- **Frontend** (`frontend/`) — the browser dashboard that displays it.
-- **Virtual robot** (`virtual_robot/`) — an optional Docker container
-  that simulates a real robot for testing, using **ROS** (Robot
-  Operating System — the standard robotics framework this robot uses)
-  and a **rosbag** (a recorded file of real robot data).
-
-There's no real robot connected yet, so the backend gets its data one
-of two ways:
-- **Bag replay** — reads pre-extracted telemetry from `backend/data/`.
-  No Docker needed. Default mode.
-- **Live mode** — connects to the virtual robot container (or, later,
-  the real robot) over **rosbridge**, ROS's WebSocket bridge, and asks
-  it live what topics exist via `rosapi` (ROS's built-in introspection
-  service) — nothing hardcoded.
-
-Swapping the virtual robot for the real one later should only require
-changes in `backend/main.py` — the frontend and wire format don't
-change.
-
-## Project structure
-
-```
-backend/          Python server (FastAPI), health checks, database
-frontend/          Browser dashboard (HTML/JS)
-virtual_robot/     Docker container simulating the robot (ROS1 + rosbridge)
-bag/               Drop a .bag file here for the virtual robot / extraction
-```
-
-## Requirements
-
-- Python 3.9+
-- Docker (only needed for virtual robot / live mode — not for bag replay)
-- Commands below use Windows PowerShell syntax (`$env:VAR="value"`);
-  on Mac/Linux use `export VAR=value` instead.
-
-## Quick start (bag replay, no Docker)
+`backend/data/*.json` (the already-extracted telemetry) is included in this
+project, so the dashboard runs out of the box without the raw bag:
 
 ```
 cd backend
 pip install -r requirements.txt
 python -m uvicorn main:app --port 8123
 ```
+
 Open `http://localhost:8123`, pick a playback speed, click **Connect**.
-Uses the pre-extracted JSON in `backend/data/` — works out of the box.
 
 ## Virtual robot mode (Docker)
 
-Instead of local JSON, point the dashboard at a Docker container that
-plays the bag as live ROS1 topics over rosbridge — same discovery path
-the backend will use with the real robot (topics/types found live via
-`rosapi`, nothing hardcoded, nothing read from `backend/data/`).
+Instead of replaying local JSON, you can point the dashboard at a "virtual
+robot" - a Docker container that plays the bag as live ROS1 topics over
+rosbridge, so the backend subscribes the same way it eventually will to the
+real robot.
 
-1. Bag file goes in `bag/`.
-2. Build and start the container: `docker compose up --build`
-   (only builds the image + starts `sshd` — nothing ROS-related
-   auto-starts, same as the real robot).
-3. In a second terminal, start the robot software yourself:
+**Live mode has zero dependency on `backend/data/` or anything extracted
+locally.** The backend asks the *container* what topics exist and what type
+each one is (via ROS's own introspection service, `rosapi`) at connect
+time, and reports each topic's rate from real message arrivals it observes
+- not from any file. You never need to have run `extract_bag.py` first, and
+you don't know in advance what topics/data you'll get - same as the real
+robot later.
+
+1. Make sure your `.bag` file is in `bag/`.
+2. Build and start the container:
+   ```
+   docker compose up --build
+   ```
+   This only builds the ROS1 Noetic image (`roboteq_msgs`/`enova_msgs`
+   compiled in) and starts `sshd`. **Nothing ROS-related starts
+   automatically** - no `roscore`, no `rosbridge`, no bag playback. This is
+   deliberate: it mirrors a robot whose onboard software has to be launched
+   manually rather than one that auto-starts on boot, so the workflow you
+   practice here is the one you'll actually use on the real robot.
+3. In a second terminal, SSH into the "robot" and start it yourself:
    ```
    ssh robot@localhost -p 2222      # password: robot
    start_robot
    ```
-   Starts `roscore`, `rosbridge` (`ws://localhost:9090`), and loops
-   `rosbag play`. Stays attached — run it inside `screen`/`tmux`/`nohup`
-   if you need it to survive closing the SSH session.
-4. In a third terminal:
+   This starts `roscore`, `rosbridge` (`ws://localhost:9090`), and loops
+   `rosbag play` over your bag - and stays attached in your terminal
+   (Ctrl+C stops bag playback). If you want it to keep running after you
+   close the SSH session, run it inside `screen`/`tmux` or with `nohup` -
+   same tradeoff you'll have on the real robot.
+4. In a third terminal, run the backend in live mode:
    ```
    cd backend
    pip install -r requirements.txt
-   $env:TELEMETRY_SOURCE="live"     # Windows PowerShell
+   $env:TELEMETRY_SOURCE="live"         # Windows PowerShell: $env:TELEMETRY_SOURCE="live"
    python -m uvicorn main:app --port 8123
    ```
-5. Open `http://localhost:8123`, click **Connect**.
+5. Open `http://localhost:8123`, click **Connect**. The dashboard now
+   discovers topics from the container live - watch the terminal/backend
+   logs, or use your SSH session (below) to see exactly what's being
+   published before it even shows up in the UI.
 
-No `TELEMETRY_SOURCE` set = defaults to bag replay.
+**If you click Connect before running `start_robot`**, it will fail/timeout
+- same as it would against a real robot whose software hasn't been started
+yet. That's expected, not a bug.
 
-**Useful commands inside the container** (same `ssh robot@localhost -p 2222`):
+No `TELEMETRY_SOURCE` set = defaults to bag replay (reads `backend/data/`,
+unchanged from before).
+
+### SSH into the virtual robot
+
+```
+ssh robot@localhost -p 2222
+```
+Password: `robot`. This is the same login `start_robot` uses above - open a
+second SSH session alongside it if you want to poke around while it's
+running. ROS environment is pre-sourced, so once you're in:
 ```
 rostopic list
 rostopic echo /battery/state
 rostopic hz /left/front/feedback
-rosbag info /bag/your_file.bag      # check what a bag actually contains
+rosmsg show roboteq_msgs/Feedback
 ```
+This is the actual discovery workflow you'll use against the real robot
+later - the dashboard's own live-mode discovery works the same way
+programmatically (`rosapi/topics`), just automated.
 
-## Re-extracting from a raw bag (optional)
+### What's still manual, and why
 
-Raw `.bag` files aren't included (too large). To regenerate
-`backend/data/*.json`: drop a `.bag` file into `bag/`, then run
-`python backend/extract_bag.py`. Auto-discovers every topic in the bag
-(no whitelist), overwrites `backend/data/*.json`.
+Which dashboard panel a topic renders into (`PANEL_MAP` in `main.py`) can't
+be discovered from the robot - a topic name alone doesn't say "this is the
+battery panel", that's a UI decision a human has to make. Any topic the
+robot publishes that isn't in `PANEL_MAP` still streams over the WebSocket
+in both bag and live mode - nothing is silently dropped - it just has no
+panel to render into yet, same as the existing LiDAR/4G placeholders.
+
+Extraction (`extract_bag.py`, bag mode only) auto-discovers every topic in
+the bag too - no hardcoded topic list there either.
+
+Live mode also has one build-time constraint: the container only has
+`roboteq_msgs` and `enova_msgs` compiled in (see `virtual_robot/Dockerfile`).
+This bag's `/nmea_sentence` topic (`nmea_msgs/Sentence`) won't deserialize
+in live mode until `nmea_msgs` is added there too - bag-replay mode is
+unaffected since it doesn't need ROS message definitions at all.
+
+## Re-extracting from the raw bag (optional)
+
+The raw `.bag` file itself is **not** included (too large for the repo/zip).
+To regenerate `backend/data/*.json` yourself:
+
+1. Drop your `.bag` file into `bag/` (filename doesn't matter — any single
+   `.bag` file in that folder is picked up automatically).
+2. Run:
+   ```
+   python backend/extract_bag.py
+   ```
+   Extracts every topic actually present in that bag (no topic whitelist),
+   overwrites `backend/data/*.json`, and removes any stale JSON left over
+   from a previous bag's topics that no longer exist. Only the topics
+   listed in `PANEL_MAP` (`main.py`) actually render into a panel; anything
+   else is still extracted and streamed, just has no panel yet.
 
 ## What's real vs. placeholder
 
 | Panel | Status |
 |---|---|
-| Battery | Live — `/battery/state`, `/charging` |
-| Motors (4x) + driver status/faults | Live — `roboteq_msgs` feedback/status |
-| GNSS (GPS position/fix) | Live — `enova_msgs` GnssFix/GnssStatus |
-| Network / 4G | Placeholder — no topic in the bag, RV55 config unconfirmed |
-| LiDAR | Placeholder — no topic in the bag |
-| Speed test | Real, standalone browser test — not tied to robot telemetry, currently targets an old/wrong endpoint (left broken pending a real robot/router address) |
-| Secure connect/disconnect | Opens/closes the WebSocket, clears telemetry on disconnect — not yet real secure transport to a robot |
-| System Health | Live — see below |
-| Event History | Live, session-scoped |
-| Database | Live — see below |
+| Battery | Live — from `/battery/state`, `/charging` |
+| Motors (4x) + driver status/faults | Live — from `roboteq_msgs` feedback/status topics |
+| GPS/GNSS | Live — from `enova_msgs` GnssFix/GnssStatus |
+| Network / 4G | **Placeholder** — no topic in the bag, RV55 config unconfirmed |
+| LiDAR | **Placeholder** — no topic in the bag |
+| Speed test | Real but standalone — browser-side test against a public CDN, not tied to robot telemetry (deliberately separate, per the project plan) |
+| Secure connect/disconnect | Connect/Disconnect buttons open/close the WebSocket and clear all telemetry on disconnect. This is **not** yet the "secure" transport to the real robot — that depends on how the robot exposes data (rosbridge/MQTT/VPN/etc.), which is still unconfirmed. |
+| System Health (anomaly detection) | Live — see dedicated section below for exactly what it does and doesn't do |
 
 ## System Health / anomaly detection
 
-A banner (OK / WARNING / CRITICAL) plus a live list of active issues.
-Four detection layers:
+A banner at the top of the dashboard (OK / WARNING / CRITICAL) plus a live
+list of active issues. Built with **no confirmed labeled fault dataset**
+(still unresolved — see "Ask supervisor" list), so the scope is
+deliberately limited to what's honestly buildable without one:
 
 1. **Hardware faults (CRITICAL)** — decoded directly from the roboteq
-   motor controllers' status bitmask (OVERHEAT, OVERVOLTAGE,
-   UNDERVOLTAGE, SHORT_CIRCUIT, EMERGENCY_STOP, etc).
-2. **Statistical anomalies (WARNING)** — each signal (e.g. battery
-   voltage) is compared to its own recent normal range (last 3 minutes).
-   A value flagged as an outlier means it's unusually far from that
-   recent range — not compared against a fixed safe range, just against
-   what's been normal for that signal recently.
-3. **Commanded-vs-measured velocity residual (WARNING)** — per motor,
-   an unusually large gap between commanded and actual velocity
-   (possible slip/stall/load issue).
-4. **GNSS fix degradation (WARNING)** — flags when the fix drops below
-   3D.
+   motor controllers' own status bitmask (`fault` field): OVERHEAT,
+   OVERVOLTAGE, UNDERVOLTAGE, SHORT_CIRCUIT, EMERGENCY_STOP, etc. This is
+   real classification, for free — the controller already knows this, the
+   code just surfaces it. Edge-triggered, no debounce — it's a direct
+   discrete report from the controller, not a noisy statistic.
+2. **Statistical anomalies (WARNING)** — a rolling baseline (mean/std) per
+   signal (battery voltage/current/temp, each motor's current/temp/supply
+   voltage), flagged when a new value is a statistical outlier (z-score >
+   3.5). The baseline covers a **3-minute time window**, not a fixed
+   sample count — different topics publish at different rates, so a time
+   window keeps "recent" consistent across every signal. This can only say
+   "unusual compared to what we've recently seen" — it cannot say *what
+   kind* of fault it is.
+3. **Commanded-vs-measured velocity residual (WARNING)** — per motor, an
+   unusually large gap between what was commanded and what was actually
+   achieved (possible slip/stall/load issue). Same time-window treatment
+   as (2).
+4. **GNSS fix degradation (WARNING)** — flags when the fix drops below 3D.
+   Edge-triggered, no debounce — same reasoning as (1).
 
-When a signal crosses into anomaly territory, that's logged as a **new**
-issue (shows up in the health banner and Event History). When it goes
-back to normal, that's logged as **cleared**. Checks 2 and 3 need 3
-anomalous samples *in a row* to fire "new", and 3 normal samples in a
-row to fire "cleared" — a single one-off spike doesn't trigger anything.
+**Debounce:** the statistical and residual checks (2 and 3) require 3
+consecutive anomalous samples before firing a new event, and 3 consecutive
+normal samples before clearing it — this kills single-sample flicker from
+brief transients. Hardware faults and GNSS fix (1 and 4) are intentionally
+not debounced, since delaying a real discrete state change isn't justified.
 
-### How the baseline works
+**Baseline warm-up:** a fresh baseline is still built per connection (no
+in-memory state survives a reconnect), but on connect it's pre-filled from
+the last 3 minutes of DB history across all past sessions, so detection
+isn't judging off a near-empty window right after connecting. The residual
+check (3) is not warmed up — it still starts cold every reconnect.
 
-Each signal (e.g. battery voltage) is judged against its own recent
-normal behavior — its "baseline". Two settings control this:
+**Known limitation:** the maneuver-vs-fault distinction isn't handled. A
+real turn or acceleration can produce genuine correlated shifts across
+multiple motor signals, and so can a real fault cascading from one motor
+to the others — the current checks can't yet tell those apart.
 
-- **3-minute memory** — the baseline only remembers the last 3 minutes
-  of samples for that signal. Older samples fall off automatically.
-- **25-sample minimum** — the system won't judge a signal as
-  normal/anomalous until it's seen at least 25 samples of it. This is
-  about *count*, not time — a fast signal (like motor feedback, ~5/sec)
-  hits 25 samples in a few seconds; a slow one (like battery, ~1/sec)
-  takes about 25 seconds. It does **not** wait a fixed 3 minutes before
-  starting.
+## Known data quirks found while building this
 
-**On connect, the system tries to skip the cold start:** it pulls each
-signal's last 3 minutes of history from the database and loads it into
-the baseline *before* any live data arrives. If there's no history in
-the last 3 minutes (first run ever, or it's been a while since the last
-session), it just starts empty and builds up from live data as normal
-— no error, no special case.
-
-This warm-up applies to hardware faults, statistical anomalies, and
-GNSS checks. The velocity-residual check (commanded vs. measured speed)
-does **not** use warm-up yet and always starts cold on reconnect.
-
-One more note: the warm-up history is pooled across *all* past runs,
-not filtered by which robot or environment it came from — there's
-currently only one robot, so this hasn't mattered yet.
-
-**Not yet handled:** normal driving (accelerating, turning) can shift
-multiple motor signals together, the same way a real fault can — the
-system can't yet tell the two apart.
-
-## Known data quirks
-
-- `/battery/state.percentage` is 0–100 scale in this bag, despite the
-  ROS spec comment saying 0–1. Frontend auto-detects.
-- `motor_temperature` is dead (constant −4.175°C) — health checks use
-  `channel_temperature` instead.
+- This bag's `/battery/state.percentage` is populated on a 0–100 scale, even
+  though the ROS `sensor_msgs/BatteryState` spec comments say 0–1. The
+  frontend auto-detects which scale it got rather than assuming.
 - No LiDAR or 4G/network topic exists anywhere in the supplied bag.
-- Bag is ROS1; real robot reportedly ROS2 — topic names are best
-  available reference only.
-- High-rate topics are decimated at extraction time to a UI-sane rate
-  (bag-extraction-only, doesn't apply to live mode).
-- The virtual robot container only has `roboteq_msgs` and `enova_msgs`
-  compiled in — `/nmea_sentence` won't work in live mode until
-  `nmea_msgs` is added too. Bag-replay mode is unaffected.
+- The bag is a ROS1 bag; you said the robot currently runs ROS2. Topic names
+  here are the best available reference, not a confirmed current topic list.
+
+## Data decimation (display only)
+
+High-rate topics (motor feedback, GNSS, roboteq status) are decimated at
+extraction time to a UI-sane rate (see `DECIMATE_HZ` in `extract_bag.py`).
+This is for readability in a browser, not a claim about the robot's real
+publish rate — availability thresholds in the frontend use these same rates
+so the 🟢/🟡/🔴 indicators stay consistent with what's actually streamed.
 
 ## Database (SQLite)
 
-`backend/dashboard.db`, stdlib `sqlite3`, two tables:
-- **`telemetry`** — every streamed message, both bag and live mode.
-- **`health_events`** — every health new/cleared event.
+`backend/db.py` — one SQLite file, `backend/dashboard.db`, stdlib
+`sqlite3` only, no new dependency. Two tables:
 
-Also now read from (`db.recent_telemetry`) to warm-start health-monitor
-baselines on connect. Grows indefinitely — no retention/rotation yet.
+- **`telemetry`** — every `{topic, t, data}` message that goes out over
+  the WebSocket, in **both** bag and live mode. `source` column ('bag'
+  or 'live') distinguishes which run produced a row. This does duplicate
+  `backend/data/*.json` while replaying a bag, but the two serve
+  different purposes: `backend/data/` is the fixed source used to
+  *replay*, the DB is the durable record of what was actually streamed
+  out on a given run.
+- **`health_events`** — every health event (new + cleared), replacing
+  the old `event_log.py` JSONL file. `GET /api/health-history` reads
+  from here now instead.
+
+This is separate from `HealthMonitor`'s own in-memory state (still
+per-connection, still resets on disconnect — unchanged): the DB is what
+lets a warning/fault that already cleared still be reviewed afterward,
+and now also keeps a durable record of raw telemetry itself, not just
+health events.
+
+Deliberately not written into `backend/data/` — that folder stays
+bag-extracted telemetry only, and live mode still never *reads* from it
+(see `main.py`); the DB is write-only from the streaming loops, nothing
+in source-selection logic reads it back.
 
 ## Not in scope for V0
 
 Robot control/commands, authentication, user management, automatic
-reconnect, DB retention/rotation.
-
-## Open questions
-
-Facts about the real robot still unconfirmed, blocking full live
-integration: RV55 router/modem access path; real robot's actual ROS
-version/topic list (this bag is ROS1, robot reportedly ROS2); LiDAR
-specifics; PC↔robot reachability/security model (rosbridge/MQTT/VPN/
-etc.); `/coil_outputs`, `/nmea_sentence`, `motor_controller_msgs` —
-unwired, unconfirmed.
+reconnect, DB retention/rotation (the DB grows indefinitely on a
+long-running deployment — fine for V0/coursework) — per the agreed
+project scope.

@@ -36,7 +36,7 @@ class RosLiveSource:
         def _cb(response):
             result.update(response)
 
-        service.call(_cb, errback=lambda e: result.update({"error": str(e)}))
+        service.call(request, _cb, errback=lambda e: result.update({"error": str(e)}))
 
         waited = 0.0
         while not result and waited < timeout:
