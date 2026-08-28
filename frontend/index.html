@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outdoor Robot Monitor — V0</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="header-row">
+    <div class="title-block">
+      <span class="eyebrow">Robot Health · V0 Prototype</span>
+      <h1>Outdoor Robot Monitor</h1>
+    </div>
+
+    <div class="pulse-strip">
+      <span class="label">telemetry</span>
+      <svg id="pulseSvg" viewBox="0 0 300 34" preserveAspectRatio="none"></svg>
+    </div>
+
+    <div class="conn-controls">
+      <select id="speedSelect">
+        <option value="1">1× (real time)</option>
+        <option value="5">5×</option>
+        <option value="20" selected>20×</option>
+        <option value="60">60×</option>
+      </select>
+      <button id="connectBtn" class="primary">Connect</button>
+      <button id="disconnectBtn" class="danger" disabled>Disconnect</button>
+      <div id="connPill" class="status-pill offline"><span class="dot"></span><span id="connLabel">Disconnected</span></div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="grid">
+
+    <!-- BATTERY -->
+    <section class="panel panel-battery">
+      <div class="panel-head">
+        <span class="panel-title">Battery</span>
+        <span class="avail offline" id="avail-battery">OFFLINE</span>
+      </div>
+      <div class="big-readout" id="batt-pct">--<span class="unit">%</span></div>
+      <div class="bar-track"><div class="bar-fill" id="batt-bar"></div></div>
+      <div class="readouts" style="margin-top:14px;">
+        <div class="ro"><span class="k">Voltage</span><span class="v" id="batt-voltage">--</span></div>
+        <div class="ro"><span class="k">Current</span><span class="v" id="batt-current">--</span></div>
+        <div class="ro"><span class="k">Temperature</span><span class="v" id="batt-temp">--</span></div>
+        <div class="ro"><span class="k">Capacity</span><span class="v" id="batt-capacity">--</span></div>
+        <div class="ro"><span class="k">Status</span><span class="v" id="batt-status">--</span></div>
+        <div class="ro"><span class="k">Charging</span><span class="v" id="batt-charging">--</span></div>
+      </div>
+    </section>
+
+    <!-- GPS -->
+    <section class="panel panel-gps">
+      <div class="panel-head">
+        <span class="panel-title">GPS / GNSS</span>
+        <span class="avail offline" id="avail-gps">OFFLINE</span>
+      </div>
+      <div class="readouts wide">
+        <div class="ro"><span class="k">Latitude</span><span class="v" id="gps-lat">--</span></div>
+        <div class="ro"><span class="k">Longitude</span><span class="v" id="gps-lon">--</span></div>
+        <div class="ro"><span class="k">Height (ellipsoid)</span><span class="v" id="gps-height">--</span></div>
+        <div class="ro"><span class="k">Ground speed</span><span class="v" id="gps-speed">--</span></div>
+        <div class="ro"><span class="k">Heading</span><span class="v" id="gps-heading">--</span></div>
+        <div class="ro"><span class="k">Satellites</span><span class="v" id="gps-sats">--</span></div>
+        <div class="ro"><span class="k">Fix type</span><span class="v" id="gps-fix">--</span></div>
+        <div class="ro"><span class="k">Differential / RTK</span><span class="v" id="gps-diff">--</span></div>
+        <div class="ro"><span class="k">Horizontal accuracy</span><span class="v" id="gps-hacc">--</span></div>
+      </div>
+    </section>
+
+    <!-- NETWORK / 4G -->
+    <section class="panel panel-network">
+      <div class="panel-head">
+        <span class="panel-title">Network / 4G</span>
+        <span class="avail offline" id="avail-network">UNCONFIRMED</span>
+      </div>
+      <div class="placeholder">
+        <span class="ph-title">No source yet</span>
+        4G/router telemetry (RV55 or otherwise) isn't in the current data.
+        This panel is a placeholder until the connectivity path is confirmed.
+      </div>
+    </section>
+
+    <!-- MOTORS -->
+    <section class="panel panel-motors">
+      <div class="panel-head">
+        <span class="panel-title">Motors / Encoders</span>
+        <span class="avail offline" id="avail-motors">OFFLINE</span>
+      </div>
+      <div class="motor-grid">
+        <div class="motor-card">
+          <div class="m-head"><span class="m-name">Left Front</span><span class="fault-chip" id="fault-left_front">--</span></div>
+          <div class="readouts" id="motor-left_front"></div>
+        </div>
+        <div class="motor-card">
+          <div class="m-head"><span class="m-name">Right Front</span><span class="fault-chip" id="fault-right_front">--</span></div>
+          <div class="readouts" id="motor-right_front"></div>
+        </div>
+        <div class="motor-card">
+          <div class="m-head"><span class="m-name">Left Rear</span><span class="fault-chip" id="fault-left_rear">--</span></div>
+          <div class="readouts" id="motor-left_rear"></div>
+        </div>
+        <div class="motor-card">
+          <div class="m-head"><span class="m-name">Right Rear</span><span class="fault-chip" id="fault-right_rear">--</span></div>
+          <div class="readouts" id="motor-right_rear"></div>
+        </div>
+      </div>
+      <div class="driver-row">
+        <span>Left driver — IC temp: <b id="drv-left-temp">--</b> · Supply: <b id="drv-left-volt">--</b></span>
+        <span>Right driver — IC temp: <b id="drv-right-temp">--</b> · Supply: <b id="drv-right-volt">--</b></span>
+      </div>
+    </section>
+
+    <!-- LIDAR -->
+    <section class="panel panel-lidar">
+      <div class="panel-head">
+        <span class="panel-title">LiDAR</span>
+        <span class="avail offline" id="avail-lidar">UNCONFIRMED</span>
+      </div>
+      <div class="placeholder">
+        <span class="ph-title">No source yet</span>
+        No LiDAR topic was present in the reference recording.
+        Placeholder until the topic/message type is confirmed.
+      </div>
+    </section>
+
+    <!-- SPEED TEST -->
+    <section class="panel panel-speed">
+      <div class="panel-head">
+        <span class="panel-title">Network Speed Test</span>
+      </div>
+      <p class="panel-note">
+        Raw network link capacity — synthetic data sent to a dedicated
+        test endpoint on the robot, independent of ROS/rosbridge. Answers
+        "is the physical/network path healthy," even before any telemetry
+        is flowing. Run manually, on demand.
+      </p>
+      <div class="speed-row">
+        <button id="speedTestBtn">Run speed test</button>
+        <div class="speed-metrics">
+          <div class="speed-metric"><div class="k">Download</div><div class="v" id="st-down">-- Mbps</div></div>
+          <div class="speed-metric"><div class="k">Upload</div><div class="v" id="st-up">-- Mbps</div></div>
+          <div class="speed-metric"><div class="k">Ping</div><div class="v" id="st-ping">-- ms</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TELEMETRY THROUGHPUT -->
+    <section class="panel panel-telemetry-throughput">
+      <div class="panel-head">
+        <span class="panel-title">Telemetry Throughput</span>
+      </div>
+      <p class="panel-note">
+        Actual ROS message data rate over rosbridge — real bytes/messages
+        from the robot's own topics, not a synthetic probe. Answers "is
+        data actually flowing right now." Updates live while connected;
+        not available in bag mode or before a live connection succeeds.
+      </p>
+      <div class="speed-row">
+        <div class="speed-metrics">
+          <div class="speed-metric"><div class="k">Data rate</div><div class="v" id="tp-bytes">-- KB/s</div></div>
+          <div class="speed-metric"><div class="k">Messages</div><div class="v" id="tp-msgs">-- msg/s</div></div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="health-banner ok" id="healthBanner">
+    <div class="health-banner-head">
+      <span class="health-badge" id="healthBadge">OK</span>
+      <span class="health-title">System Health</span>
+      <span class="health-sub" id="healthSub">No active anomalies</span>
+    </div>
+    <ul class="health-list" id="healthList"></ul>
+  </div>
+
+  <div class="health-history" id="healthHistory">
+    <div class="health-history-head" id="healthHistoryToggle">
+      <span class="health-title">Event History</span>
+      <span class="health-sub" id="healthHistoryCount">0 events</span>
+      <span class="health-history-chevron">▾</span>
+    </div>
+    <ul class="health-list health-history-list" id="healthHistoryList"></ul>
+  </div>
+
+  <footer>V0 prototype · telemetry replayed from reference rosbag · not connected to a live robot</footer>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

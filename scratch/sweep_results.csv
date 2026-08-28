@@ -1,0 +1,9 @@
+debounce,percentile,scope,speed,total,statistical,comms,residual,gnss,delay_summary
+1.0,99.0,all,1.0,173,91,8,24,17,residual: median 1.0s max 6.7s n=24; statistical: median 1.0s max 34.5s n=91
+2.0,99.0,all,1.0,136,48,8,24,17,residual: median 2.1s max 6.7s n=24; statistical: median 2.3s max 51.0s n=48
+3.0,99.0,all,1.0,121,35,8,20,17,residual: median 3.1s max 6.7s n=20; statistical: median 5.0s max 52.0s n=35
+5.0,99.0,all,1.0,102,33,8,12,17,residual: median 5.0s max 6.7s n=12; statistical: median 5.2s max 54.0s n=33
+2.0,95.0,all,1.0,136,48,8,24,17,residual: median 2.1s max 6.7s n=24; statistical: median 2.3s max 51.0s n=48
+2.0,99.0,cmd,1.0,136,48,8,24,17,residual: median 2.1s max 6.7s n=24; statistical: median 2.3s max 51.0s n=48
+2.0,99.0,all,5.0,66,13,4,8,17,residual: median 3.7s max 6.8s n=8; statistical: median 2.0s max 10.6s n=13
+2.0,99.0,all,20.0,46,2,3,3,17,residual: median 29.6s max 29.6s n=3; statistical: median 2.0s max 2.0s n=2

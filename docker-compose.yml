@@ -1,0 +1,23 @@
+services:
+  virtual-robot:
+    build: ./virtual_robot
+    ports:
+      - "9090:9090"
+      - "8091:8091"    # speed-test target - independent of ROS/rosbridge
+    # SSH (port 22) is intentionally NOT published to the host anymore -
+    # the ROS stack auto-starts (see entrypoint.sh), so there's nothing
+    # left that requires SSHing in. sshd still runs inside the container
+    # (keeps it alive as the foreground process); if you ever need a shell
+    # for debugging, use `docker compose exec virtual-robot bash` instead -
+    # no host port needed, and one less thing that can collide with
+    # something else already using 2222 on your machine.
+    volumes:
+      - ./bag:/bag:ro
+    healthcheck:
+      # Objective "is rosbridge actually up" signal instead of guessing a
+      # sleep duration - checks the same port 9090 the backend connects to.
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 9090))\" || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
