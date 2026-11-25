@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime database (grows with every session - live mode records everything)
+backend/dashboard.db
+backend/dashboard.db-shm
+backend/dashboard.db-wal
+
+# Raw recordings: too large for git; see bag/README.md
+bag/*.bag
+
+# Local run logs
+golden_*.txt
+validate_out.txt

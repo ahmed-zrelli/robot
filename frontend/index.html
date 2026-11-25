@@ -3,171 +3,410 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Outdoor Robot Monitor — V0</title>
+<title>PGuard — Robot Health Monitor</title>
+<link rel="icon" href="assets/enova.png">
 <link rel="stylesheet" href="style.css">
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
 </head>
 <body>
 
-<header>
-  <div class="header-row">
-    <div class="title-block">
-      <span class="eyebrow">Robot Health · V0 Prototype</span>
-      <h1>Outdoor Robot Monitor</h1>
-    </div>
+<!-- Icon sprite (Lucide-style strokes, inlined so the dashboard works offline on the robot network) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+    <symbol id="i-battery" viewBox="0 0 24 24"><rect x="2" y="7" width="16" height="10" rx="2"/><line x1="22" y1="11" x2="22" y2="13"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+    <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></symbol>
+    <symbol id="i-wifi-off" viewBox="0 0 24 24"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+    <symbol id="i-box" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+    <symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+  </defs>
+</svg>
 
-    <div class="pulse-strip">
-      <span class="label">telemetry</span>
-      <svg id="pulseSvg" viewBox="0 0 300 34" preserveAspectRatio="none"></svg>
-    </div>
+<header class="topbar">
+  <a class="brand" href="https://www.enovarobotics.eu/" target="_blank" rel="noopener noreferrer">
+    <img src="assets/enova.png" alt="Enova Robotics">
+    <span class="tagline">Robots For a Safer World</span>
+  </a>
 
-    <div class="conn-controls">
-      <select id="speedSelect">
-        <option value="1">1× (real time)</option>
-        <option value="5">5×</option>
-        <option value="20" selected>20×</option>
-        <option value="60">60×</option>
-      </select>
-      <button id="connectBtn" class="primary">Connect</button>
-      <button id="disconnectBtn" class="danger" disabled>Disconnect</button>
-      <div id="connPill" class="status-pill offline"><span class="dot"></span><span id="connLabel">Disconnected</span></div>
-    </div>
+  <div class="title-block">
+    <h1>PGuard — Robot Health Monitor</h1>
+    <span class="subtitle">Real-time supervision · rules + ML anomaly detection</span>
+  </div>
+
+  <div class="conn-controls">
+    <select id="speedSelect" title="Replay speed (bag mode only)">
+      <option value="1">1× real time</option>
+      <option value="5">5×</option>
+      <option value="20" selected>20×</option>
+      <option value="60">60×</option>
+    </select>
+    <button id="connectBtn" class="primary">Connect</button>
+    <button id="disconnectBtn" class="danger" disabled>Disconnect</button>
+    <div id="connPill" class="status-pill offline"><span class="dot"></span><span id="connLabel">Disconnected</span></div>
+    <div class="chip-box"><svg class="ic"><use href="#i-clock"/></svg><span id="hdr-clock" class="mono teal">--:--:--</span></div>
+    <div class="chip-box"><span class="mono dim">Up <span id="hdr-uptime">00:00:00</span></span></div>
   </div>
 </header>
+
+<div id="dropBanner" class="drop-banner" hidden>
+  <svg class="ic"><use href="#i-wifi-off"/></svg>
+  <b>TELEMETRY LINK LOST</b>
+  <span>Last data: <span class="mono" id="drop-last">—</span></span>
+  <span class="grow"></span>
+  <span class="drop-hint" id="drop-hint">Reconnecting automatically…</span>
+</div>
+
+<!-- STATS BAR -->
+<div class="stats-bar">
+  <div class="stat"><span class="stat-k">System status</span><span class="stat-v" id="st-system">—</span></div>
+  <div class="stat"><span class="stat-k">Active alerts</span><span class="stat-v" id="st-active">0</span></div>
+  <div class="stat"><span class="stat-k">Battery</span><span class="stat-v" id="st-batt">—</span></div>
+  <div class="stat"><span class="stat-k">GNSS fix</span><span class="stat-v" id="st-fix">—</span></div>
+  <div class="stat"><span class="stat-k">Message rate</span><span class="stat-v" id="st-rate">—</span></div>
+  <div class="stat"><span class="stat-k">Session events</span><span class="stat-v" id="st-events">0</span></div>
+</div>
 
 <main>
   <div class="grid">
 
+    <!-- 3D ROBOT (hero) -->
+    <section class="panel panel-3d" id="panel3d">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-box"/></svg>Robot PGuard — Live 3D status</span>
+        <span class="head-tools">
+          <button id="r3d-auto" class="mini-btn active" title="Toggle turntable">Auto-rotate</button>
+          <button id="r3d-reset" class="mini-btn" title="Reset view">Reset</button>
+          <span class="avail offline" id="avail-3d">OFFLINE</span>
+        </span>
+      </div>
+      <div id="robot3d">
+        <canvas id="robot3d-canvas"></canvas>
+        <div class="r3d-legend">
+          <span><i class="lg lg-wheel"></i>Wheels turn at measured velocity</span>
+          <span><i class="lg lg-fault"></i>Faulted side glows red</span>
+          <span><i class="lg lg-beacon"></i>Beacon pulses on critical</span>
+        </div>
+        <div class="r3d-hint">Drag to orbit · Wheel to zoom</div>
+      </div>
+      <div id="robot3d-fallback" hidden>3D view unavailable (WebGL disabled in this browser)</div>
+    </section>
+
+    <!-- ROBOT STATE (active alerts) -->
+    <section class="panel panel-state health-banner ok" id="healthBanner">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-shield"/></svg>Robot state</span>
+        <span class="health-badge" id="healthBadge">OK</span>
+      </div>
+      <div class="state-hero">
+        <div class="state-ring"><svg class="ic big"><use href="#i-shield"/></svg></div>
+        <div>
+          <div class="state-label" id="stateLabel">NOMINAL</div>
+          <div class="health-sub" id="healthSub">No active anomalies</div>
+        </div>
+      </div>
+      <div class="sub-title">Detection layers</div>
+      <div class="detectors" id="detectors"></div>
+      <div class="sub-title">Active alerts</div>
+      <ul class="health-list" id="healthList"></ul>
+      <div class="empty-note" id="healthEmpty">All monitored signals within normal behaviour.</div>
+    </section>
+
+    <!-- STATE TIMELINE -->
+    <section class="panel panel-timeline">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-activity"/></svg>Robot state timeline — last 10 min</span>
+        <span class="legend tl-legend"><i class="sw tl-ok"></i>Nominal<i class="sw tl-warn"></i>Warning<i class="sw tl-crit"></i>Critical<i class="sw tl-ack"></i>Acknowledged<i class="sw tl-off"></i>No link</span>
+      </div>
+      <canvas id="stateTimeline" class="timeline"></canvas>
+      <div class="tl-axis"><span>−10 min</span><span>−5 min</span><span>now</span></div>
+    </section>
+
     <!-- BATTERY -->
     <section class="panel panel-battery">
       <div class="panel-head">
-        <span class="panel-title">Battery</span>
+        <span class="panel-title"><svg class="ic"><use href="#i-battery"/></svg>Battery</span>
         <span class="avail offline" id="avail-battery">OFFLINE</span>
       </div>
-      <div class="big-readout" id="batt-pct">--<span class="unit">%</span></div>
-      <div class="bar-track"><div class="bar-fill" id="batt-bar"></div></div>
-      <div class="readouts" style="margin-top:14px;">
-        <div class="ro"><span class="k">Voltage</span><span class="v" id="batt-voltage">--</span></div>
-        <div class="ro"><span class="k">Current</span><span class="v" id="batt-current">--</span></div>
-        <div class="ro"><span class="k">Temperature</span><span class="v" id="batt-temp">--</span></div>
-        <div class="ro"><span class="k">Capacity</span><span class="v" id="batt-capacity">--</span></div>
-        <div class="ro"><span class="k">Status</span><span class="v" id="batt-status">--</span></div>
-        <div class="ro"><span class="k">Charging</span><span class="v" id="batt-charging">--</span></div>
+      <div class="batt-top">
+        <div class="gauge">
+          <svg viewBox="0 0 100 100">
+            <circle class="g-track" cx="50" cy="50" r="40"/>
+            <circle class="g-fill" id="batt-ring" cx="50" cy="50" r="40"/>
+          </svg>
+          <div class="gauge-center">
+            <div class="gauge-val" id="batt-pct">--<span class="unit">%</span></div>
+            <div class="gauge-lbl">charge</div>
+          </div>
+        </div>
+        <div class="kv-stack">
+          <div class="kv"><span class="k">Voltage</span><span class="v" id="batt-voltage">--</span></div>
+          <div class="kv"><span class="k">Current</span><span class="v" id="batt-current">--</span></div>
+          <div class="kv"><span class="k">Status</span><span class="v" id="batt-status">--</span></div>
+          <div class="kv"><span class="k">Charging</span><span class="v" id="batt-charging">--</span></div>
+        </div>
       </div>
+      <details class="more">
+        <summary>Battery details</summary>
+        <div class="readouts">
+          <div class="ro"><span class="k">Capacity</span><span class="v" id="batt-capacity">--</span></div>
+          <div class="ro"><span class="k">Charge</span><span class="v" id="batt-charge">--</span></div>
+          <div class="ro"><span class="k">Health</span><span class="v" id="batt-health">--</span></div>
+          <div class="ro"><span class="k">Technology</span><span class="v" id="batt-tech">--</span></div>
+          <div class="ro"><span class="k">Present</span><span class="v" id="batt-present">--</span></div>
+          <div class="ro"><span class="k">Location</span><span class="v" id="batt-location">--</span></div>
+          <div class="ro full"><span class="k">Cell voltages</span><span class="v" id="batt-cellv">--</span></div>
+          <div class="ro full"><span class="k">Serial number</span><span class="v" id="batt-serial">--</span></div>
+        </div>
+      </details>
     </section>
 
     <!-- GPS -->
     <section class="panel panel-gps">
       <div class="panel-head">
-        <span class="panel-title">GPS / GNSS</span>
+        <span class="panel-title"><svg class="ic"><use href="#i-pin"/></svg>GPS / GNSS</span>
         <span class="avail offline" id="avail-gps">OFFLINE</span>
       </div>
-      <div class="readouts wide">
-        <div class="ro"><span class="k">Latitude</span><span class="v" id="gps-lat">--</span></div>
-        <div class="ro"><span class="k">Longitude</span><span class="v" id="gps-lon">--</span></div>
-        <div class="ro"><span class="k">Height (ellipsoid)</span><span class="v" id="gps-height">--</span></div>
-        <div class="ro"><span class="k">Ground speed</span><span class="v" id="gps-speed">--</span></div>
-        <div class="ro"><span class="k">Heading</span><span class="v" id="gps-heading">--</span></div>
-        <div class="ro"><span class="k">Satellites</span><span class="v" id="gps-sats">--</span></div>
-        <div class="ro"><span class="k">Fix type</span><span class="v" id="gps-fix">--</span></div>
-        <div class="ro"><span class="k">Differential / RTK</span><span class="v" id="gps-diff">--</span></div>
-        <div class="ro"><span class="k">Horizontal accuracy</span><span class="v" id="gps-hacc">--</span></div>
+      <div class="gps-top">
+        <svg class="sky" viewBox="0 0 56 56" aria-hidden="true">
+          <circle cx="28" cy="28" r="24"/><circle cx="28" cy="28" r="16"/><circle cx="28" cy="28" r="8"/>
+          <line x1="28" y1="4" x2="28" y2="52"/><line x1="4" y1="28" x2="52" y2="28"/>
+          <circle class="sky-dot" id="sky-dot" cx="28" cy="28" r="3"/>
+        </svg>
+        <div class="gps-main">
+          <div class="gps-badges"><span class="fix-badge" id="gps-fix">--</span><span class="dim small"><span id="gps-sats">--</span> satellites</span></div>
+          <div class="mono teal small">lat <span id="gps-lat">--</span></div>
+          <div class="mono teal small">lon <span id="gps-lon">--</span></div>
+          <div class="mono dim small">±<span id="gps-hacc">--</span> horizontal</div>
+        </div>
       </div>
+      <div class="readouts compact">
+        <div class="ro"><span class="k">Ground speed</span><span class="v" id="gps-speed">--</span></div>
+        <div class="ro"><span class="k">Diff / RTK</span><span class="v" id="gps-diff">--</span></div>
+        <div class="ro"><span class="k">RTK correction</span><span class="v" id="gps-rtk">--</span></div>
+        <div class="ro"><span class="k">Carrier solution</span><span class="v" id="gps-carrier">--</span></div>
+      </div>
+      <details class="more">
+        <summary>All GNSS fields</summary>
+        <div class="readouts one">
+          <div class="ro"><span class="k">Height (ellipsoid)</span><span class="v" id="gps-height">--</span></div>
+          <div class="ro"><span class="k">Height (MSL)</span><span class="v" id="gps-hmsl">--</span></div>
+          <div class="ro"><span class="k">Velocity (N/E/D)</span><span class="v" id="gps-velned">--</span></div>
+          <div class="ro"><span class="k">Heading (vehicle)</span><span class="v" id="gps-heading">--</span></div>
+          <div class="ro"><span class="k">Heading (motion)</span><span class="v" id="gps-motion-heading">--</span></div>
+          <div class="ro"><span class="k">Vertical accuracy</span><span class="v" id="gps-vacc">--</span></div>
+          <div class="ro"><span class="k">Velocity accuracy</span><span class="v" id="gps-velacc">--</span></div>
+          <div class="ro"><span class="k">Magnetic declination</span><span class="v" id="gps-magdec">--</span></div>
+        </div>
+      </details>
     </section>
 
-    <!-- NETWORK / 4G -->
-    <section class="panel panel-network">
+    <!-- LINK: pulse + throughput + speed test -->
+    <section class="panel panel-link">
       <div class="panel-head">
-        <span class="panel-title">Network / 4G</span>
-        <span class="avail offline" id="avail-network">UNCONFIRMED</span>
+        <span class="panel-title"><svg class="ic"><use href="#i-wifi"/></svg>Robot link</span>
       </div>
-      <div class="placeholder">
-        <span class="ph-title">No source yet</span>
-        4G/router telemetry (RV55 or otherwise) isn't in the current data.
-        This panel is a placeholder until the connectivity path is confirmed.
+      <div class="pulse-strip">
+        <span class="label">telemetry pulse · each tick = one message</span>
+        <svg id="pulseSvg" viewBox="0 0 300 34" preserveAspectRatio="none"></svg>
       </div>
+      <div class="sub-title">Telemetry throughput <span class="dim">(live mode)</span></div>
+      <div class="metric-row">
+        <div class="metric"><div class="k">Data rate</div><div class="v" id="tp-bytes">-- KB/s</div></div>
+        <div class="metric"><div class="k">Messages</div><div class="v" id="tp-msgs">-- msg/s</div></div>
+      </div>
+      <div class="sub-title">Network speed test <span class="dim">(on demand)</span></div>
+      <div class="metric-row">
+        <div class="metric"><div class="k">Down</div><div class="v" id="st-down">-- Mbps</div></div>
+        <div class="metric"><div class="k">Up</div><div class="v" id="st-up">-- Mbps</div></div>
+        <div class="metric"><div class="k">Ping</div><div class="v" id="st-ping">-- ms</div></div>
+      </div>
+      <button id="speedTestBtn" class="wide-btn">Run speed test</button>
     </section>
 
     <!-- MOTORS -->
     <section class="panel panel-motors">
       <div class="panel-head">
-        <span class="panel-title">Motors / Encoders</span>
+        <span class="panel-title"><svg class="ic"><use href="#i-zap"/></svg>Motors / encoders (Roboteq feedback)</span>
         <span class="avail offline" id="avail-motors">OFFLINE</span>
       </div>
       <div class="motor-grid">
         <div class="motor-card">
-          <div class="m-head"><span class="m-name">Left Front</span><span class="fault-chip" id="fault-left_front">--</span></div>
+          <div class="m-head"><span class="m-name"><i class="sw c1"></i>Left front</span><span class="fault-chip" id="fault-left_front">--</span></div>
           <div class="readouts" id="motor-left_front"></div>
         </div>
         <div class="motor-card">
-          <div class="m-head"><span class="m-name">Right Front</span><span class="fault-chip" id="fault-right_front">--</span></div>
+          <div class="m-head"><span class="m-name"><i class="sw c2"></i>Right front</span><span class="fault-chip" id="fault-right_front">--</span></div>
           <div class="readouts" id="motor-right_front"></div>
         </div>
         <div class="motor-card">
-          <div class="m-head"><span class="m-name">Left Rear</span><span class="fault-chip" id="fault-left_rear">--</span></div>
+          <div class="m-head"><span class="m-name"><i class="sw c3"></i>Left rear</span><span class="fault-chip" id="fault-left_rear">--</span></div>
           <div class="readouts" id="motor-left_rear"></div>
         </div>
         <div class="motor-card">
-          <div class="m-head"><span class="m-name">Right Rear</span><span class="fault-chip" id="fault-right_rear">--</span></div>
+          <div class="m-head"><span class="m-name"><i class="sw c4"></i>Right rear</span><span class="fault-chip" id="fault-right_rear">--</span></div>
           <div class="readouts" id="motor-right_rear"></div>
         </div>
       </div>
       <div class="driver-row">
-        <span>Left driver — IC temp: <b id="drv-left-temp">--</b> · Supply: <b id="drv-left-volt">--</b></span>
-        <span>Right driver — IC temp: <b id="drv-right-temp">--</b> · Supply: <b id="drv-right-volt">--</b></span>
+        <div class="driver"><span class="drv-name"><svg class="ic"><use href="#i-cpu"/></svg>Left driver</span>
+          <span>IC <b id="drv-left-temp">--</b></span><span>Supply <b id="drv-left-volt">--</b></span><span>ADC <b id="drv-left-adc">--</b></span><span>Status <b id="drv-left-status">--</b></span></div>
+        <div class="driver"><span class="drv-name"><svg class="ic"><use href="#i-cpu"/></svg>Right driver</span>
+          <span>IC <b id="drv-right-temp">--</b></span><span>Supply <b id="drv-right-volt">--</b></span><span>ADC <b id="drv-right-adc">--</b></span><span>Status <b id="drv-right-status">--</b></span></div>
       </div>
     </section>
 
-    <!-- LIDAR -->
-    <section class="panel panel-lidar">
+    <!-- LIVE CHARTS -->
+    <section class="panel panel-charts">
       <div class="panel-head">
-        <span class="panel-title">LiDAR</span>
+        <span class="panel-title"><svg class="ic"><use href="#i-chart"/></svg>Live trends — last 60 s</span>
+      </div>
+      <div class="chart-block">
+        <div class="chart-head"><span>Wheel speed (rpm)</span><span class="legend"><i class="sw c1"></i>LF<i class="sw c2"></i>RF<i class="sw c3"></i>LR<i class="sw c4"></i>RR</span></div>
+        <canvas id="chart-speed" class="chart"></canvas>
+      </div>
+      <div class="chart-block">
+        <div class="chart-head"><span>Motor current (A)</span><span class="legend"><i class="sw c1"></i>LF<i class="sw c2"></i>RF<i class="sw c3"></i>LR<i class="sw c4"></i>RR</span></div>
+        <canvas id="chart-current" class="chart"></canvas>
+      </div>
+      <div class="chart-block">
+        <div class="chart-head"><span>Battery current (A)</span><span class="legend"><i class="sw c5"></i>pack</span></div>
+        <canvas id="chart-batt" class="chart"></canvas>
+      </div>
+    </section>
+
+    <!-- EVENT HISTORY (alert feed) -->
+    <section class="panel panel-history health-history" id="healthHistory">
+      <div class="panel-head health-history-head" id="healthHistoryToggle">
+        <span class="panel-title"><svg class="ic"><use href="#i-bell"/></svg>Detected events — session history</span>
+        <span class="head-tools">
+          <span class="count-badge" id="healthHistoryCount">0 events</span>
+          <span class="health-history-chevron">▾</span>
+        </span>
+      </div>
+      <div class="health-history-tools">
+        <div class="filter-chips" role="group" aria-label="Filter events">
+          <button class="filter-chip active" data-filter="all">All</button>
+          <button class="filter-chip" data-filter="critical">Critical</button>
+          <button class="filter-chip" data-filter="warning">Warning</button>
+          <button class="filter-chip" data-filter="ml">ML only</button>
+          <button class="filter-chip" data-filter="rules">Rules only</button>
+          <button class="filter-chip" data-filter="failure">Failures</button>
+        </div>
+        <button id="groupToggle" class="ghost-btn"title="Group co-active fault + ML events into incidents (display only)">Grouped</button>
+      </div>
+      <ul class="health-list health-history-list" id="healthHistoryList"></ul>
+    </section>
+
+    <!-- ALERT DETAIL -->
+    <section class="panel panel-detail" id="alertDetail">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-shield"/></svg>Alert details &amp; action</span>
+        <span class="health-badge" id="ad-sev" hidden>—</span>
+      </div>
+      <div class="ad-empty" id="ad-empty">
+        <svg class="ic big"><use href="#i-bell"/></svg>
+        <span>Click any alert (active or in the history) to see what it means and what to check.</span>
+      </div>
+      <div class="ad-body" id="ad-body" hidden>
+        <div class="ad-box">
+          <div class="ad-k">Alert</div>
+          <div class="ad-title" id="ad-title">—</div>
+          <div class="ad-meta" id="ad-meta">—</div>
+        </div>
+        <div class="ad-row">
+          <div class="ad-box"><div class="ad-k">Detector</div><div class="ad-v" id="ad-kind">—</div></div>
+          <div class="ad-box"><div class="ad-k">Capability at risk</div><div class="ad-v" id="ad-cap">—</div></div>
+        </div>
+        <div class="ad-box"><div class="ad-k">What it means</div><div class="ad-text" id="ad-means">—</div></div>
+        <div class="ad-box ad-action"><div class="ad-k">Recommended action</div><ul class="ad-list" id="ad-action"></ul></div>
+        <div class="ad-box"><div class="ad-k">Raw detector message</div><div class="ad-raw" id="ad-raw">—</div></div>
+        <button id="ad-ack" class="wide-btn">Acknowledge</button>
+      </div>
+    </section>
+
+    <!-- MOTOR COMMANDS -->
+    <section class="panel panel-commands">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-send"/></svg>Motor commands</span>
+        <span class="avail offline" id="avail-cmd-motors">OFFLINE</span>
+      </div>
+      <div class="cmd-grid">
+        <div class="cmd-cell"><span class="m-name"><i class="sw c1"></i>Left front</span><div class="readouts one" id="cmd-left-front"></div><div class="topic-source">/left/front/cmd</div></div>
+        <div class="cmd-cell"><span class="m-name"><i class="sw c2"></i>Right front</span><div class="readouts one" id="cmd-right-front"></div><div class="topic-source">/right/front/cmd</div></div>
+        <div class="cmd-cell"><span class="m-name"><i class="sw c3"></i>Left rear</span><div class="readouts one" id="cmd-left-rear"></div><div class="topic-source">/left/rear/cmd</div></div>
+        <div class="cmd-cell"><span class="m-name"><i class="sw c4"></i>Right rear</span><div class="readouts one" id="cmd-right-rear"></div><div class="topic-source">/right/rear/cmd</div></div>
+      </div>
+      <div class="panel-note">Command topics publish on change: a quiet command stream shows QUIET, never a dead sensor.</div>
+    </section>
+
+    <!-- COIL OUTPUTS -->
+    <section class="panel panel-coil">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-layers"/></svg>Coil outputs</span>
+        <span class="avail offline" id="avail-coil-outputs">OFFLINE</span>
+      </div>
+      <div class="coil-grid">
+        <div class="coil"><span class="k">OUT 1</span><span class="v" id="coil-0">--</span></div>
+        <div class="coil"><span class="k">OUT 2</span><span class="v" id="coil-1">--</span></div>
+        <div class="coil"><span class="k">OUT 3</span><span class="v" id="coil-2">--</span></div>
+        <div class="coil"><span class="k">OUT 4</span><span class="v" id="coil-3">--</span></div>
+      </div>
+      <div class="topic-source">/coil_outputs · std_msgs/Int32MultiArray</div>
+    </section>
+
+    <!-- NMEA -->
+    <section class="panel panel-nmea">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-terminal"/></svg>NMEA sentence</span>
+        <span class="avail offline" id="avail-nmea">OFFLINE</span>
+      </div>
+      <div class="nmea-value" id="nmea-sentence">--</div>
+      <div class="topic-source">/nmea_sentence · nmea_msgs/Sentence</div>
+    </section>
+
+    <!-- PLACEHOLDERS -->
+    <section class="panel panel-ph">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-wifi"/></svg>Network / 4G</span>
+        <span class="avail offline" id="avail-network">UNCONFIRMED</span>
+      </div>
+      <div class="placeholder"><span class="ph-title">No source yet</span>4G/router telemetry (RV55 or other) is not in the recorded data. Placeholder until the connectivity path is confirmed.</div>
+    </section>
+    <section class="panel panel-ph">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="ic"><use href="#i-radar"/></svg>LiDAR</span>
         <span class="avail offline" id="avail-lidar">UNCONFIRMED</span>
       </div>
-      <div class="placeholder">
-        <span class="ph-title">No source yet</span>
-        No LiDAR topic was present in the reference recording.
-        Placeholder until the topic/message type is confirmed.
-      </div>
+      <div class="placeholder"><span class="ph-title">No source yet</span>No LiDAR topic was present in the reference recording. Placeholder until the topic and message type are confirmed.</div>
     </section>
 
-    <!-- SPEED TEST -->
-    <section class="panel panel-speed">
-      <div class="panel-head">
-        <span class="panel-title">Network Speed Test</span>
-      </div>
-      <div class="speed-row">
-        <button id="speedTestBtn">Run speed test</button>
-        <div class="speed-metrics">
-          <div class="speed-metric"><div class="k">Download</div><div class="v" id="st-down">-- Mbps</div></div>
-          <div class="speed-metric"><div class="k">Upload</div><div class="v" id="st-up">-- Mbps</div></div>
-          <div class="speed-metric"><div class="k">Ping</div><div class="v" id="st-ping">-- ms</div></div>
-        </div>
+    <!-- FOOTER / EXPORT -->
+    <section class="panel panel-export">
+      <div class="export-info" id="footer-status">Waiting for telemetry source · press Connect</div>
+      <div class="history-actions">
+        <a id="exportJson" class="export-btn ghost" href="/api/report?format=json"><svg class="ic"><use href="#i-download"/></svg>Export JSON</a>
+        <a id="exportHtml" class="export-btn" href="/api/report?format=html"><svg class="ic"><use href="#i-download"/></svg>Export HTML report</a>
       </div>
     </section>
 
   </div>
-
-  <div class="health-banner ok" id="healthBanner">
-    <div class="health-banner-head">
-      <span class="health-badge" id="healthBadge">OK</span>
-      <span class="health-title">System Health</span>
-      <span class="health-sub" id="healthSub">No active anomalies</span>
-    </div>
-    <ul class="health-list" id="healthList"></ul>
-  </div>
-
-  <div class="health-history" id="healthHistory">
-    <div class="health-history-head" id="healthHistoryToggle">
-      <span class="health-title">Event History</span>
-      <span class="health-sub" id="healthHistoryCount">0 events</span>
-      <span class="health-history-chevron">▾</span>
-    </div>
-    <ul class="health-list health-history-list" id="healthHistoryList"></ul>
-  </div>
-
-  <footer>V0 prototype · telemetry replayed from reference rosbag · not connected to a live robot</footer>
 </main>
 
 <script src="app.js"></script>
+<script type="module" src="robot3d.js"></script>
 </body>
 </html>

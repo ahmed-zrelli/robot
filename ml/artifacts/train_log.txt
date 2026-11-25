@@ -1,0 +1,25 @@
+== Phase 2 training (revised spec) ==
+bag duration: 12757.6s
+sensor-glitch rows flagged (any raw supply_voltage < 40V): 4063 (6.37%) -- kept, stratified at calibration/eval; in-fault-window: 4056
+grid rows @ 5Hz: 63786  features: 13
+stale-dropped rows (>2.0s from a topic sample): 0 (0.00%)
+dropout/NaN cells pre-fill: 0 (0.00%); rows kept: 63786/63786
+fault-flagged grid rows: 4052  inside window: 4051  outside window: 1
+  outside rows lie 0.16s from the window edge (as-of latch: the clear is observed on the next status sample)
+embargo-excluded rows (+-60s): 4994; normal pool: 58792
+split sizes (rows): train 40553 (drive 5626, idle 34927)  val 8218 (drive 970, idle 7248)  test 8818 (drive 1270, idle 7548)
+  purge gaps: drive 300 rows, idle 300 rows (~60s target)
+  train: t 0.2->9677.6s  drive 13.9%
+  val: t 2535.4->11187.2s  drive 11.8%
+  test: t 2796.8->12756.8s  drive 14.4%
+RobustScaler fit on train only; range guard passed.
+IF train pool: 49895 rows (drive 30.0%, oversampled from 13.9%)
+AE windows: train 8107 (glitch 0)  val 1640 (glitch 0)  test 1760 (glitch 0)  (len 20, stride 5)
+calibration pools: IF 8218/8218 clean val rows; AE 1640/1640 clean val windows
+IF thresholds: idle 0.3989 (k=1.00)  drive 0.7392 (k=7.13)  pooled k=6.78
+AE thresholds: idle 3.254241 (k=-0.01)  drive 288.053034 (k=13.35)  pooled k=8.03
+TEST point-FPR IF-only: {'idle': 0.011526232114467409, 'drive': 0.007874015748031496, 'pooled': 0.011000226808800181}  (clean rows: {'idle': 0.011526232114467409, 'drive': 0.007874015748031496, 'pooled': 0.011000226808800181})
+TEST point-FPR fused: {'idle': 0.01232114467408585, 'drive': 0.012598425196850394, 'pooled': 0.012361079609888864}  (clean rows: {'idle': 0.01232114467408585, 'drive': 0.012598425196850394, 'pooled': 0.012361079609888864})
+TEST glitch-row flag fraction (transients, pre-persistence): nan% of 0 glitch rows)
+TEST event-FPR fused (>2s persistence): {'idle': 0.0, 'drive': 0.0, 'pooled': 0.0}  events: 0 in 2.77h -> 0.00/h
+FAULT-WINDOW: detection delay 0.1s from 3125.631s; sustained 93.0% overall; 96.0% excl. driving segs; driving-seg flag rate 0.0% (n_drive_rows=139)

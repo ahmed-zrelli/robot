@@ -1,0 +1,215 @@
+{
+  "schema_version": "1.0",
+  "features": [
+    "bat_voltage",
+    "bat_current",
+    "bat_percentage",
+    "motor_LF_current",
+    "motor_LF_supply_voltage",
+    "motor_LF_supply_current",
+    "motor_LF_channel_temp",
+    "motor_LR_current",
+    "motor_LR_supply_voltage",
+    "motor_LR_supply_current",
+    "motor_LR_channel_temp",
+    "motor_RF_current",
+    "motor_RF_supply_voltage",
+    "motor_RF_supply_current",
+    "motor_RF_channel_temp",
+    "motor_RR_current",
+    "motor_RR_supply_voltage",
+    "motor_RR_supply_current",
+    "motor_RR_channel_temp",
+    "driver_L_ic_temp",
+    "driver_R_ic_temp",
+    "gnss_fix_type",
+    "gnss_num_sv"
+  ],
+  "ml_features": [
+    "bat_current",
+    "motor_LF_current",
+    "motor_LR_current",
+    "motor_RF_current",
+    "motor_RR_current",
+    "motor_LF_supply_current",
+    "motor_LR_supply_current",
+    "motor_RF_supply_current",
+    "motor_RR_supply_current",
+    "motor_LF_vdrop",
+    "motor_LR_vdrop",
+    "motor_RF_vdrop",
+    "motor_RR_vdrop"
+  ],
+  "ml_feature_index": {
+    "bat_current": 0,
+    "motor_LF_current": 1,
+    "motor_LR_current": 2,
+    "motor_RF_current": 3,
+    "motor_RR_current": 4,
+    "motor_LF_supply_current": 5,
+    "motor_LR_supply_current": 6,
+    "motor_RF_supply_current": 7,
+    "motor_RR_supply_current": 8,
+    "motor_LF_vdrop": 9,
+    "motor_LR_vdrop": 10,
+    "motor_RF_vdrop": 11,
+    "motor_RR_vdrop": 12
+  },
+  "excluded_from_ml": [
+    "gnss_fix_type",
+    "gnss_num_sv",
+    "bat_percentage",
+    "motor_LF_channel_temp",
+    "motor_LR_channel_temp",
+    "motor_RF_channel_temp",
+    "motor_RR_channel_temp",
+    "driver_L_ic_temp",
+    "driver_R_ic_temp",
+    "bat_voltage",
+    "motor_LF_supply_voltage",
+    "motor_LR_supply_voltage",
+    "motor_RF_supply_voltage",
+    "motor_RR_supply_voltage"
+  ],
+  "ml_transform": "vdrop_M = supply_voltage_M(raw, uncleaned) - bat_voltage; glitch rows (any raw supply_voltage < FLOOR) kept with raw values; thresholds calibrated on clean rows only; persistence separates glitch transients from sustained collapse. PHASE3: do NOT apply clean_supply_voltage() to vdrop inputs.",
+  "exclusion_reason": {
+    "gnss_fix_type+gnss_num_sv": "discrete/environment; rule-based via health_monitor category 3",
+    "bat_percentage": "monotonic discharge ramp 74.7->61.6%; dashboard gauge, not a model input",
+    "channel_temperature x4 + ic_temperature x2": "slow ~9C thermal drift; tracked by health_monitor adaptive baselines (cat. 2/6)",
+    "bat_voltage + supply_voltage x4 (absolute)": "coherent ~0.35V discharge sag breaks fixed thresholds; replaced by vdrop differentials"
+  },
+  "grid_hz": 5.0,
+  "asof_tol_s": 0.3,
+  "max_age_s": 2.0,
+  "fault_window_s": [
+    3125.6,
+    4004.4
+  ],
+  "embargo_s": 60.0,
+  "split_fracs": [
+    0.7,
+    0.15,
+    0.15
+  ],
+  "split_gap_s": 60.0,
+  "split_rows": {
+    "train": [
+      0,
+      9677
+    ],
+    "val": [
+      2535,
+      11187
+    ],
+    "test": [
+      2796,
+      12756
+    ]
+  },
+  "ae_window": 20,
+  "ae_stride": 5,
+  "ae_arch": {
+    "input": 260,
+    "hidden": 128,
+    "latent": 32
+  },
+  "if_params": {
+    "n_estimators": 200,
+    "max_samples": "auto",
+    "contamination": "auto",
+    "random_state": 42
+  },
+  "target_fpr_per_model": 0.005,
+  "thresholds": {
+    "if": {
+      "pooled": 0.7192563423050234,
+      "idle": 0.39892446763855627,
+      "drive": 0.7391533304107251,
+      "mu": 0.3433233535283546,
+      "sigma": 0.055481636717152345,
+      "k_idle": 1.0021534583353848,
+      "k_drive": 7.134432224851763,
+      "k_pooled": 6.7758092770981255
+    },
+    "ae": {
+      "pooled": 174.72979342941815,
+      "idle": 3.2542407477797832,
+      "drive": 288.05303358873965,
+      "mu": 3.5064049904641164,
+      "sigma": 21.319887347119973,
+      "k_idle": -0.011827653616490477,
+      "k_drive": 13.346535277857082,
+      "k_pooled": 8.031158216325379
+    },
+    "fusion": "OR with per-state thresholds + 2s persistence at inference"
+  },
+  "test_gate": {
+    "point_fpr_if": {
+      "idle": 0.011526232114467409,
+      "drive": 0.007874015748031496,
+      "pooled": 0.011000226808800181
+    },
+    "point_fpr_if_clean": {
+      "idle": 0.011526232114467409,
+      "drive": 0.007874015748031496,
+      "pooled": 0.011000226808800181
+    },
+    "point_fpr_fused": {
+      "idle": 0.01232114467408585,
+      "drive": 0.012598425196850394,
+      "pooled": 0.012361079609888864
+    },
+    "point_fpr_fused_clean": {
+      "idle": 0.01232114467408585,
+      "drive": 0.012598425196850394,
+      "pooled": 0.012361079609888864
+    },
+    "glitch_row_flag_frac": NaN,
+    "event_fpr_fused": {
+      "idle": 0.0,
+      "drive": 0.0,
+      "pooled": 0.0
+    },
+    "events_per_hour": 0.0,
+    "fault_detection_delay_s": 0.13000000000010914,
+    "fault_sustained_frac": 0.9299044151115157,
+    "fault_sustained_frac_excl_driving": 0.9602820211515863,
+    "fault_driving_seg_flag_frac": 0.0
+  },
+  "scaler": "RobustScaler (fit train only)",
+  "phase3_constraints": [
+    "Do NOT apply features.clean_supply_voltage() to vdrop inputs (would null the fault signature into a flat line).",
+    "Replicate ML_TRANSFORM_NOTE exactly: raw supply_voltage minus battery voltage; 5Hz grid; RobustScaler from scaler.pkl; per-state thresholds + 2s persistence before alerting.",
+    "Call features.require_matching_schema() on metadata.json schema_version+features before loading models."
+  ],
+  "seed": 42,
+  "bag": {
+    "duration_s": 12757.618033224,
+    "topics": {
+      "/left/rear/feedback": "roboteq_msgs/msg/Feedback",
+      "/left/front/feedback": "roboteq_msgs/msg/Feedback",
+      "/battery/state": "sensor_msgs/msg/BatteryState",
+      "/left/front/cmd": "roboteq_msgs/msg/Command",
+      "/left/rear/cmd": "roboteq_msgs/msg/Command",
+      "/coil_outputs": "std_msgs/msg/Int32MultiArray",
+      "/charging": "std_msgs/msg/Bool",
+      "/right/rear/feedback": "roboteq_msgs/msg/Feedback",
+      "/ublox/gnss_fix": "enova_msgs/msg/GnssFix",
+      "/ublox/gnss_status": "enova_msgs/msg/GnssStatus",
+      "/ublox/rtk_correction": "std_msgs/msg/Bool",
+      "/left_roboteq_driver/status": "roboteq_msgs/msg/Status",
+      "/right/front/feedback": "roboteq_msgs/msg/Feedback",
+      "/nmea_sentence": "nmea_msgs/msg/Sentence",
+      "/right_roboteq_driver/status": "roboteq_msgs/msg/Status",
+      "/right/front/cmd": "roboteq_msgs/msg/Command",
+      "/right/rear/cmd": "roboteq_msgs/msg/Command"
+    }
+  },
+  "artifacts": [
+    "scaler.pkl",
+    "if_model.pkl",
+    "ae_model.pt",
+    "ae_model.onnx",
+    "threshold_curve.csv"
+  ]
+}

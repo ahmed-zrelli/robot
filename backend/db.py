@@ -21,6 +21,7 @@ reused for the process lifetime, WAL mode so reads (API) and writes
 Deliberately NOT backend/data/ - that folder stays bag-extracted
 telemetry only, and live mode must never read from it (see main.py).
 """
+import atexit
 import json
 import sqlite3
 import time
@@ -71,6 +72,41 @@ _conn.execute(
 _conn.commit()
 
 
+# Write batching: the streaming loops call record_telemetry/log_event
+# per message (hundreds/sec at high replay speed or on a busy robot).
+# Committing per row is a synchronous fsync-ish stall on the server's event
+# loop each time. Batch instead: commit at most every COMMIT_EVERY_N writes
+# or COMMIT_EVERY_S seconds, whichever comes first. Same-connection reads
+# (recent_telemetry, read_events, list_sessions) still see uncommitted rows,
+# so nothing downstream observes a difference. atexit flush covers the tail
+# on clean shutdown; unclean kill can lose <0.5s of trailing rows - an
+# acceptable monitoring-dashboard tradeoff, documented here, not silent.
+COMMIT_EVERY_N = 200
+COMMIT_EVERY_S = 0.5
+_pending_writes = 0
+_last_commit_t = time.monotonic()
+
+
+def _maybe_commit():
+    global _pending_writes, _last_commit_t
+    _pending_writes += 1
+    now = time.monotonic()
+    if _pending_writes >= COMMIT_EVERY_N or now - _last_commit_t >= COMMIT_EVERY_S:
+        _conn.commit()
+        _pending_writes = 0
+        _last_commit_t = now
+
+
+def _flush():
+    try:
+        _conn.commit()
+    except Exception:
+        pass
+
+
+atexit.register(_flush)
+
+
 def record_telemetry(session_id, source, topic, t, data):
     """Append one telemetry message, tagged to its session. Fire-and-
     forget: a DB failure must never take down telemetry streaming."""
@@ -80,7 +116,7 @@ def record_telemetry(session_id, source, topic, t, data):
             "VALUES (?, ?, ?, ?, ?, ?)",
             (session_id, source, topic, t, json.dumps(data), time.time()),
         )
-        _conn.commit()
+        _maybe_commit()
     except Exception:
         pass
 
@@ -104,7 +140,7 @@ def log_event(session_id, topic, ev):
                 time.time(),
             ),
         )
-        _conn.commit()
+        _maybe_commit()
     except Exception:
         pass
 
@@ -175,21 +211,65 @@ def latest_session_id():
 
 
 def list_sessions(limit=50):
-    """Distinct session_ids that have logged health events, most recent
-    first, each with its first/last event time - lets a caller browse
-    past sessions instead of only ever seeing the latest one."""
+    """Distinct session_ids that have logged EITHER a health event OR
+    telemetry, most recent first, each with its first/last activity time
+    and health-event count - lets a caller browse past sessions instead
+    of only ever seeing the latest one.
+
+    Previously grouped by health_events alone, which silently dropped
+    any session that streamed telemetry but never triggered a single
+    health event (e.g. a short connection, or a quiet stretch of robot
+    behavior) - that session existed in the DB and was reachable via
+    /api/health-history?session_id=... directly, just invisible from
+    this list. latest_session_id() already falls back to telemetry when
+    health_events has nothing, so this brings list_sessions in line with
+    that same fallback instead of only fixing it in one place.
+    event_count reflects health events only (0 for telemetry-only
+    sessions) - that field's meaning is unchanged, just no longer used
+    to decide which sessions exist."""
     rows = _conn.execute(
         """
-        SELECT session_id, MIN(logged_at), MAX(logged_at), COUNT(*)
-        FROM health_events
+        SELECT session_id,
+               MIN(activity_at) AS started_at,
+               MAX(activity_at) AS ended_at,
+               SUM(is_health_event) AS event_count
+        FROM (
+            SELECT session_id, logged_at AS activity_at, 1 AS is_health_event
+            FROM health_events
+            UNION ALL
+            SELECT session_id, recorded_at AS activity_at, 0 AS is_health_event
+            FROM telemetry
+        )
         GROUP BY session_id
-        ORDER BY MAX(logged_at) DESC
+        ORDER BY ended_at DESC
         LIMIT ?
         """,
         (limit,),
     ).fetchall()
     return [
         {"session_id": r[0], "started_at": r[1], "ended_at": r[2], "event_count": r[3]}
+        for r in rows
+    ]
+
+
+def session_topic_stats(session_id):
+    """Per-topic message coverage for one session: message count plus
+    stream-relative and wall-clock spans. Read-only aggregate for the
+    /api/report endpoint - no new writes, one GROUP BY query."""
+    rows = _conn.execute(
+        """
+        SELECT topic, COUNT(*), MIN(t), MAX(t), MIN(recorded_at),
+               MAX(recorded_at)
+        FROM telemetry
+        WHERE session_id = ?
+        GROUP BY topic
+        ORDER BY topic
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        {"topic": r[0], "messages": r[1], "first_t": r[2], "last_t": r[3],
+         "first_seen": r[4], "last_seen": r[5]}
         for r in rows
     ]
 
