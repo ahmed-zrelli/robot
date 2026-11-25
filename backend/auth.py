@@ -97,7 +97,14 @@ def password_problem(username, password):
     return None
 
 
-def create_user(username, password, created_by=None, enforce_policy=True):
+ROLES = ("admin", "operator")
+
+
+def create_user(username, password, created_by=None, enforce_policy=True, role="operator"):
+    if role not in ROLES:
+        return "Role must be admin or operator."
+    if db.count_users() == 0:
+        role = "admin"  # the first account must be able to manage the others
     if not USERNAME_RE.match(username or ""):
         return "Username: 3-32 letters, digits, '.', '_' or '-'."
     if db.get_user(username) is not None:
@@ -106,7 +113,7 @@ def create_user(username, password, created_by=None, enforce_policy=True):
         problem = password_problem(username, password)
         if problem:
             return problem
-    db.add_user(username, *hash_password(password), created_by=created_by)
+    db.add_user(username, *hash_password(password), created_by=created_by, role=role)
     return None
 
 
@@ -143,6 +150,17 @@ def current_user(request):
     """Username of the request's session; None when login is disabled."""
     s = _session(request.cookies.get(COOKIE))
     return s["user"] if s else None
+
+
+def current_role(request):
+    """Role of the signed-in user, read from the DB on every request (not
+    cached in the session) so a demotion applies at once. With no account
+    at all (first run, login off) everyone is effectively admin."""
+    if not enabled():
+        return "admin"
+    user = current_user(request)
+    row = db.get_user(user) if user else None
+    return row["role"] if row else None
 
 
 def _end_sessions(username, keep=None):
@@ -282,6 +300,22 @@ def note_blocked(ip, what):
                                f"further attempts from this IP not recorded for {BLOCKED_AUDIT_EVERY_S} s")
 
 
+# Roles, enforced HERE for every request (deny by default): all of
+# /api/settings* and /api/audit are admin-only, except the two things an
+# operator needs for their own account. A route added later under those
+# prefixes is therefore admin-only unless it is explicitly listed below.
+# Acknowledging alerts (/api/acks) stays open to operators: it is their job.
+OPERATOR_ALLOWED = {("GET", "/api/settings"), ("POST", "/api/settings/password")}
+ADMIN_PREFIXES = ("/api/settings", "/api/audit")
+
+
+def _admin_only(request):
+    if (request.method, request.url.path) in OPERATOR_ALLOWED:  # exact match only
+        return False
+    path = request.url.path.rstrip("/") or "/"
+    return any(path == p or path.startswith(p + "/") for p in ADMIN_PREFIXES)
+
+
 async def require_login(request: Request, call_next):
     """HTTP middleware. WebSockets are checked separately in main.py
     (Starlette HTTP middleware does not see WebSocket handshakes)."""
@@ -292,6 +326,10 @@ async def require_login(request: Request, call_next):
     if not enabled() or request.url.path in PUBLIC_PATHS:
         return await call_next(request)
     if valid_token(request.cookies.get(COOKIE)):
+        if _admin_only(request) and current_role(request) != "admin":
+            audit("admin_denied", ip, current_user(request),
+                  f"{request.method} {request.url.path} (operator account)", "warning")
+            return JSONResponse({"ok": False, "error": "Administrator rights required."}, status_code=403)
         return await call_next(request)
     if request.url.path.startswith("/api/"):
         return JSONResponse({"ok": False, "error": "authentication required"}, status_code=401)
@@ -318,12 +356,19 @@ async def _json(request):
 
 def settings_state(request):
     s = _session(request.cookies.get(COOKIE))
-    return {
+    role = current_role(request)
+    mine = {
         "ok": True,
         "auth_enabled": enabled(),
         "me": s["user"] if s else None,
+        "role": role,
         "weak_password": bool(s and s.get("weak")),
         "password_policy": {"min_length": policy.get("password_min_length")},
+    }
+    if role != "admin":
+        return mine  # an operator sees only their own account - no lists, no other users
+    return {
+        **mine,
         "users": db.list_users(),
         "trusted_ips": db.list_trusted_ips(),
         "dashboard_ips": db.list_dashboard_ips(),
@@ -360,11 +405,37 @@ async def add_user(request):
     if body is None:
         return _err("Expected a JSON body.")
     actor = current_user(request) or "first-run setup"
+    role = str(body.get("role", "operator"))
+    first = db.count_users() == 0
     problem = create_user(str(body.get("username", "")).strip(), str(body.get("password", "")),
-                          created_by=actor)
+                          created_by=actor, role=role)
     if problem:
         return _err(problem)
-    audit("user_created", _client_ip(request), actor, f"account '{str(body.get('username')).strip()}'")
+    role = "admin" if first else role
+    audit("user_created", _client_ip(request), actor,
+          f"account '{str(body.get('username')).strip()}' ({role})", "warning" if role == "admin" else "info")
+    return {"ok": True}
+
+
+async def set_role(request, username):
+    me = current_user(request)
+    body = await _json(request)
+    if body is None:
+        return _err("Expected a JSON body.")
+    role = str(body.get("role", ""))
+    if role not in ROLES:
+        return _err("Role must be admin or operator.")
+    user = db.get_user(username)
+    if user is None:
+        return _err("No such user.", 404)
+    if username == me:
+        return _err("You cannot change your own role (ask another admin).")
+    if user["role"] == role:
+        return {"ok": True}
+    if user["role"] == "admin" and db.count_admins() <= 1:
+        return _err("Cannot demote the last admin.")
+    db.set_user_role(username, role)
+    audit("role_changed", _client_ip(request), me, f"account '{username}': {user['role']} -> {role}", "warning")
     return {"ok": True}
 
 
@@ -376,6 +447,8 @@ def delete_user(request, username):
         return _err("No such user.", 404)
     if db.count_users() <= 1:
         return _err("Cannot delete the last account.")
+    if db.get_user(username)["role"] == "admin" and db.count_admins() <= 1:
+        return _err("Cannot delete the last admin.")
     db.delete_user(username)
     _end_sessions(username)
     audit("user_deleted", _client_ip(request), me, f"account '{username}'", "warning")

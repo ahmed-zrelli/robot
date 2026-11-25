@@ -36,14 +36,27 @@ async function load() {
   $("weakWarn").hidden = !state.weak_password;
   $("myAccount").hidden = !state.me;
   $("policyHint").textContent = `At least ${state.password_policy.min_length} characters, different from the username.`;
+  const admin = state.role === "admin";
+  $("me").textContent += state.role && state.auth_enabled ? ` (${state.role})` : "";
+  document.querySelectorAll(".admin-only").forEach(el => { el.hidden = !admin; });
+  if (!admin) {
+    // Operator: the server returns only their own account and refuses
+    // every admin route - the page just doesn't ask for them.
+    document.title = "PGuard — My account";
+    $("subtitle").textContent = "Change your password";
+    $("pageTitle").textContent = "PGuard — My account";
+    return;
+  }
 
   $("userCount").textContent = state.users.length;
   $("userRows").innerHTML = state.users.map(u => `
     <tr><td><b>${esc(u.username)}</b>${u.username === state.me ? ' <span class="tag">you</span>' : ""}</td>
+    <td><span class="role-tag ${u.role === "admin" ? "admin" : ""}">${esc(u.role)}</span></td>
     <td class="mono">${esc(when(u.created_at))}</td><td>${esc(u.created_by || "—")}</td>
-    <td>${u.username !== state.me && state.users.length > 1
-      ? `<button class="ghost-btn danger-btn" data-del-user="${esc(u.username)}">Delete</button>` : ""}</td></tr>`).join("")
-    || `<tr><td colspan="4" class="dim">No account yet.</td></tr>`;
+    <td>${u.username !== state.me
+      ? `<div class="row-btns"><button class="ghost-btn" data-role-user="${esc(u.username)}" data-role-to="${u.role === "admin" ? "operator" : "admin"}">${u.role === "admin" ? "Make operator" : "Make admin"}</button>
+         <button class="ghost-btn danger-btn" data-del-user="${esc(u.username)}">Delete</button></div>` : ""}</td></tr>`).join("")
+    || `<tr><td colspan="5" class="dim">No account yet.</td></tr>`;
 
   $("dashIpCount").textContent = state.dashboard_ips.length;
   $("dashIpRows").innerHTML = state.dashboard_ips.map(t => `
@@ -81,7 +94,7 @@ $("pwForm").addEventListener("submit", async (e) => {
 
 $("userForm").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const r = await api("POST", "/api/settings/users", { username: $("newUser").value, password: $("newUserPw").value });
+  const r = await api("POST", "/api/settings/users", { username: $("newUser").value, password: $("newUserPw").value, role: $("newUserRole").value });
   if (r && r.ok) {
     const first = !state.auth_enabled;
     e.target.reset();
@@ -111,6 +124,11 @@ document.addEventListener("click", async (e) => {
     flash(r && r.ok ? "Removed." : (r ? r.error : "Request failed"), !!(r && r.ok)); load();
   }
   const u = e.target.closest("[data-del-user]");
+  const ru = e.target.closest("[data-role-user]");
+  if (ru && confirm(`Make "${ru.dataset.roleUser}" ${ru.dataset.roleTo === "admin" ? "an admin" : "an operator"}?`)) {
+    const r = await api("POST", `/api/settings/users/${encodeURIComponent(ru.dataset.roleUser)}/role`, { role: ru.dataset.roleTo });
+    flash(r && r.ok ? "Role changed - it applies immediately." : (r ? r.error : "Request failed"), !!(r && r.ok)); load();
+  }
   const ip = e.target.closest("[data-del-ip]");
   if (u && confirm(`Delete account "${u.dataset.delUser}"? Its open sessions end immediately.`)) {
     const r = await api("DELETE", `/api/settings/users/${encodeURIComponent(u.dataset.delUser)}`);

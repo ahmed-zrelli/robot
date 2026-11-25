@@ -65,6 +65,9 @@ function goToLogin() {
     const s = await r.json();
     const f = $("logoutForm");
     if (f && s.enabled) f.hidden = false;
+    // Operators only manage their own password there.
+    const link = $("settingsLink");
+    if (link && s.role === "operator") { link.textContent = "My account"; link.title = "Change your password"; }
   } catch (e) { /* older backend without auth: nothing to show */ }
 })();
 

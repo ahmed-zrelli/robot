@@ -85,10 +85,18 @@ def _init_schema(conn):
             salt        TEXT NOT NULL,   -- hex, 16 random bytes per user
             iterations  INTEGER NOT NULL,
             created_at  REAL NOT NULL,
-            created_by  TEXT
+            created_by  TEXT,
+            role        TEXT NOT NULL DEFAULT 'operator'   -- 'admin' | 'operator'
         )
         """
     )
+    # Migration for databases created before roles existed: every account
+    # then had full rights, so existing accounts become admins (nobody
+    # silently loses access); new accounts default to operator.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+    if "role" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'operator'")
+        conn.execute("UPDATE users SET role = 'admin'")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS dashboard_allowed_ips (
@@ -178,25 +186,35 @@ def count_users():
 
 def get_user(username):
     row = _conn.execute(
-        "SELECT username, pw_hash, salt, iterations FROM users WHERE username = ?",
+        "SELECT username, pw_hash, salt, iterations, role FROM users WHERE username = ?",
         (username,)).fetchone()
     if row is None:
         return None
-    return {"username": row[0], "pw_hash": row[1], "salt": row[2], "iterations": row[3]}
+    return {"username": row[0], "pw_hash": row[1], "salt": row[2], "iterations": row[3], "role": row[4]}
 
 
 def list_users():
     rows = _conn.execute(
-        "SELECT username, created_at, created_by FROM users ORDER BY username").fetchall()
-    return [{"username": r[0], "created_at": r[1], "created_by": r[2]} for r in rows]
+        "SELECT username, created_at, created_by, role FROM users ORDER BY username").fetchall()
+    return [{"username": r[0], "created_at": r[1], "created_by": r[2], "role": r[3]} for r in rows]
 
 
-def add_user(username, pw_hash, salt, iterations, created_by=None):
+def add_user(username, pw_hash, salt, iterations, created_by=None, role="operator"):
     _conn.execute(
-        "INSERT INTO users (username, pw_hash, salt, iterations, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (username, pw_hash, salt, iterations, time.time(), created_by))
+        "INSERT INTO users (username, pw_hash, salt, iterations, created_at, created_by, role) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (username, pw_hash, salt, iterations, time.time(), created_by, role))
     _conn.commit()
+
+
+def count_admins():
+    return _conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+
+
+def set_user_role(username, role):
+    cur = _conn.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+    _conn.commit()
+    return cur.rowcount == 1
 
 
 def set_user_password(username, pw_hash, salt, iterations):

@@ -11,8 +11,8 @@
 <header class="topbar">
   <a class="brand" href="/"><img src="assets/enova.png" alt="Enova Robotics"><span class="tagline">Robots For a Safer World</span></a>
   <div class="title-block">
-    <h1>PGuard — Settings</h1>
-    <span class="subtitle">Accounts · Access lists · Robot · Policy · Audit log</span>
+    <h1 id="pageTitle">PGuard — Settings</h1>
+    <span class="subtitle" id="subtitle">Accounts · Access lists · Robot · Policy · Audit log</span>
   </div>
   <div class="conn-controls">
     <span class="chip-box"><span class="mono dim">Signed in as <b id="me" class="teal">—</b></span></span>
@@ -40,19 +40,20 @@
     </section>
 
     <!-- USERS -->
-    <section class="panel set-panel">
-      <div class="panel-head"><span class="panel-title">Operator accounts</span><span class="count-badge" id="userCount">0</span></div>
-      <table class="set-table"><thead><tr><th>Username</th><th>Created</th><th>By</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
+    <section class="panel set-panel admin-only">
+      <div class="panel-head"><span class="panel-title">Accounts</span><span class="count-badge" id="userCount">0</span></div>
+      <table class="set-table"><thead><tr><th>Username</th><th>Role</th><th>Created</th><th>By</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
       <form id="userForm" class="set-form inline">
         <input id="newUser" placeholder="username" autocomplete="off" required>
         <input id="newUserPw" type="password" placeholder="initial password" autocomplete="new-password" required>
+        <select id="newUserRole" class="role-select"><option value="operator">operator</option><option value="admin">admin</option></select>
         <button class="primary" type="submit">Add account</button>
       </form>
-      <div class="hint">Passwords are stored only as salted PBKDF2-SHA256 hashes. Deleting an account ends its open sessions.</div>
+      <div class="hint"><b>Operators</b> watch the dashboard, acknowledge alerts and change their own password. <b>Admins</b> also manage accounts, access lists, the robot connection, the policy and the audit log. Passwords are stored only as salted PBKDF2-SHA256 hashes. Deleting an account ends its open sessions; the last admin cannot be deleted or demoted.</div>
     </section>
 
     <!-- DASHBOARD ACCESS -->
-    <section class="panel set-panel wide">
+    <section class="panel set-panel wide admin-only">
       <div class="panel-head"><span class="panel-title">Dashboard access — computers allowed to open this dashboard</span><span class="count-badge" id="dashIpCount">0</span></div>
       <div class="hint" id="dashIpMode"></div>
       <table class="set-table"><thead><tr><th>IP or network</th><th>Label</th><th>Added</th><th>By</th><th></th></tr></thead><tbody id="dashIpRows"></tbody></table>
@@ -65,7 +66,7 @@
     </section>
 
     <!-- TRUSTED IPS -->
-    <section class="panel set-panel wide">
+    <section class="panel set-panel wide admin-only">
       <div class="panel-head"><span class="panel-title">Security watch — machines trusted to connect to the robot (rosbridge)</span><span class="count-badge" id="ipCount">0</span></div>
       <div class="hint" id="ipMode"></div>
       <table class="set-table"><thead><tr><th>IP address</th><th>Label</th><th>Added</th><th>By</th><th></th></tr></thead><tbody id="ipRows"></tbody></table>
@@ -77,7 +78,7 @@
       <div class="hint">Any client connected to the robot's rosbridge whose IP is not in this list raises a critical alert. Changes apply immediately, without reconnecting.</div>
     </section>
     <!-- ROBOT CONNECTION -->
-    <section class="panel set-panel" id="robotPanel">
+    <section class="panel set-panel admin-only" id="robotPanel">
       <div class="panel-head"><span class="panel-title">Robot connection (rosbridge)</span><span class="count-badge" id="robotSource">—</span></div>
       <div class="hint" id="robotNow"></div>
       <form id="robotForm" class="set-form">
@@ -97,7 +98,7 @@
     </section>
 
     <!-- POLICY -->
-    <section class="panel set-panel" id="policyPanel">
+    <section class="panel set-panel admin-only" id="policyPanel">
       <div class="panel-head"><span class="panel-title">Security policy</span></div>
       <form id="policyForm" class="set-form"><div id="policyRows" class="policy-grid"></div>
         <button class="primary" type="submit">Save policy</button></form>
@@ -105,7 +106,7 @@
     </section>
 
     <!-- AUDIT LOG -->
-    <section class="panel set-panel wide" id="auditPanel">
+    <section class="panel set-panel wide admin-only" id="auditPanel">
       <div class="panel-head"><span class="panel-title">Audit log — who did what, from where</span><span class="count-badge" id="auditCount">0</span></div>
       <div class="audit-bar">
         <span id="auditIntegrity" class="integrity">checking…</span>

@@ -249,7 +249,8 @@ async def logout(request: Request):
 async def auth_status(request: Request):
     return {"enabled": auth.enabled(),
             "logged_in": auth.valid_token(request.cookies.get(auth.COOKIE)),
-            "user": auth.current_user(request)}
+            "user": auth.current_user(request),
+            "role": auth.current_role(request) if auth.valid_token(request.cookies.get(auth.COOKIE)) else None}
 
 
 # Settings (accounts + Security-watch trusted IPs), stored in SQLite and
@@ -267,6 +268,11 @@ async def settings_password(request: Request):
 @app.post("/api/settings/users")
 async def settings_add_user(request: Request):
     return await auth.add_user(request)
+
+
+@app.post("/api/settings/users/{username}/role")
+async def settings_set_role(request: Request, username: str):
+    return await auth.set_role(request, username)
 
 
 @app.delete("/api/settings/users/{username}")

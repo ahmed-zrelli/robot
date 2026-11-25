@@ -462,5 +462,113 @@ class TestRobotAddress(Base):
         self.assertEqual(policy.robot()["host"], "localhost")   # testing never saves
 
 
+class TestRoles(Base):
+    """admin vs operator - enforced in the middleware for every request."""
+    ADMIN_ROUTES = [
+        ("GET", "/api/settings/policy", None), ("POST", "/api/settings/policy", {"login_max_fails": 20}),
+        ("DELETE", "/api/settings/policy/login_max_fails", None),
+        ("POST", "/api/settings/users", {"username": "mallory", "password": "long enough pw", "role": "admin"}),
+        ("DELETE", "/api/settings/users/alice", None),
+        ("POST", "/api/settings/users/bob/role", {"role": "admin"}),
+        ("POST", "/api/settings/trusted-ips", {"ip": "6.6.6.6"}), ("DELETE", "/api/settings/trusted-ips/1.1.1.1", None),
+        ("POST", "/api/settings/dashboard-ips", {"entry": "6.6.6.0/24"}),
+        ("DELETE", "/api/settings/dashboard-ips/1.1.1.0/24", None),
+        ("POST", "/api/settings/robot", {"host": "6.6.6.6", "port": 9090, "speedtest_port": 8091}),
+        ("DELETE", "/api/settings/robot", None),
+        ("POST", "/api/settings/robot/test", {"host": "127.0.0.1", "port": 1, "speedtest_port": 8091}),
+        ("GET", "/api/audit", None), ("GET", "/api/audit/", None), ("GET", "/api/settings/", None),
+    ]
+
+    def setUp(self):
+        super().setUp(); self.add("alice"); self.add("bob")   # first account = admin, then operator
+        self.login("alice")
+        self.op = TestClient(main.app, follow_redirects=False)
+        self.login("bob", client=self.op)
+
+    def test_first_account_is_admin_next_default_operator(self):
+        self.assertEqual({u["username"]: u["role"] for u in db.list_users()}, {"alice": "admin", "bob": "operator"})
+
+    def test_operator_blocked_from_every_admin_route(self):
+        for method, path, body in self.ADMIN_ROUTES:
+            r = self.op.request(method, path, json=body) if body else self.op.request(method, path)
+            self.assertEqual(r.status_code, 403, (method, path))
+        self.assertEqual(policy.get("login_max_fails"), 5)
+        self.assertEqual([u["username"] for u in db.list_users()], ["alice", "bob"])
+        self.assertEqual(db.trusted_ip_set(), set())
+        self.assertEqual(policy.robot()["host"] != "6.6.6.6", True)
+        denied = [a for a in db.audit_list(500) if a["event"] == "admin_denied"]
+        self.assertEqual(len(denied), len(self.ADMIN_ROUTES)); self.assertEqual(denied[0]["actor"], "bob")
+
+    def test_operator_sees_only_own_account_and_can_do_their_job(self):
+        st = self.op.get("/api/settings").json()
+        self.assertEqual((st["me"], st["role"]), ("bob", "operator"))
+        for k in ("users", "trusted_ips", "dashboard_ips", "your_ip"):
+            self.assertNotIn(k, st)
+        self.assertTrue(self.op.post("/api/settings/password",
+                                     json={"current": self.PASSWORD, "new": "bob new password"}).json()["ok"])
+        for path in ("/", "/settings.html", "/api/health-history", "/api/acks", "/api/report?format=html"):
+            self.assertEqual(self.op.get(path).status_code, 200, path)
+        ack = {"key": "k1", "kind": "comms", "severity": "warning", "signal": "s", "message": "m"}
+        self.assertTrue(self.op.post("/api/acks", json=ack).json()["ok"])
+        self.assertEqual(self.op.get("/api/auth-status").json()["role"], "operator")
+
+    def test_admin_promotes_and_demotion_applies_immediately(self):
+        self.assertTrue(self.c.post("/api/settings/users/bob/role", json={"role": "admin"}).json()["ok"])
+        self.assertEqual(self.op.get("/api/audit").status_code, 200)            # same session, new rights
+        self.assertTrue(self.c.post("/api/settings/users/bob/role", json={"role": "operator"}).json()["ok"])
+        self.assertEqual(self.op.get("/api/audit").status_code, 403)            # revoked at once
+        row = next(a for a in db.audit_list(100) if a["event"] == "role_changed")
+        self.assertIn("admin -> operator", row["detail"])
+
+    def test_last_admin_protected(self):
+        # The sole admin cannot demote or delete themself - so the dashboard
+        # can never end up with nobody able to manage it.
+        self.assertFalse(self.c.post("/api/settings/users/alice/role", json={"role": "operator"}).json()["ok"])
+        self.assertFalse(self.c.delete("/api/settings/users/alice").json()["ok"])
+        # Hand-over works: promote bob, bob demotes alice; now bob is alone
+        # and the same rules protect him.
+        self.c.post("/api/settings/users/bob/role", json={"role": "admin"})
+        self.assertTrue(self.op.post("/api/settings/users/alice/role", json={"role": "operator"}).json()["ok"])
+        self.assertEqual(self.c.post("/api/settings/users/bob/role", json={"role": "operator"}).status_code, 403)
+        self.assertFalse(self.op.post("/api/settings/users/bob/role", json={"role": "operator"}).json()["ok"])
+        self.assertEqual(db.count_admins(), 1)
+
+    def test_last_admin_rule_backstop(self):
+        # Defence in depth: even if the own-account rule were bypassed, the
+        # handler itself refuses to remove the last admin.
+        class Req:
+            cookies = {}
+            client = None
+        orig = auth.current_user
+        auth.current_user = lambda request: "someone-else"
+        try:
+            self.assertIn("last admin", auth.delete_user(Req(), "alice").body.decode())
+        finally:
+            auth.current_user = orig
+
+    def test_cannot_delete_or_demote_last_admin_via_other_admin_path(self):
+        db.add_user("carol", *auth.hash_password("whatever pw"), role="admin")
+        self.c.delete("/api/settings/users/carol")      # fine: alice stays admin
+        self.assertEqual(db.count_admins(), 1)
+        self.assertFalse(self.c.post("/api/settings/users/nobody/role", json={"role": "admin"}).json()["ok"])
+        self.assertFalse(self.c.post("/api/settings/users/bob/role", json={"role": "root"}).json()["ok"])
+
+    def test_admin_creates_admin_and_bad_role_refused(self):
+        self.assertFalse(self.c.post("/api/settings/users", json={"username": "dave", "password": "long enough pw",
+                                                                  "role": "superuser"}).json()["ok"])
+        self.assertTrue(self.c.post("/api/settings/users", json={"username": "dave", "password": "long enough pw",
+                                                                 "role": "admin"}).json()["ok"])
+        self.assertEqual(db.get_user("dave")["role"], "admin")
+
+    def test_migration_makes_existing_accounts_admins(self):
+        conn = sqlite3.connect(os.path.join(self._tmp.name, "old.db"))
+        conn.execute("CREATE TABLE users (username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, salt TEXT NOT NULL, "
+                     "iterations INTEGER NOT NULL, created_at REAL NOT NULL, created_by TEXT)")
+        conn.execute("INSERT INTO users VALUES ('old', 'h', 's', 1, 0, NULL)"); conn.commit()
+        db._init_schema(conn)
+        self.assertEqual(conn.execute("SELECT role FROM users").fetchone()[0], "admin")
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
