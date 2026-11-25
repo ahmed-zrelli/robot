@@ -24,13 +24,100 @@ import uuid
 from collections import defaultdict, deque
 from pathlib import Path
 
+import aiohttp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from ros_live_source import RosLiveSource
-from health_monitor import HealthMonitor, MONITORED_FIELDS, WINDOW_SECONDS, MAX_SAMPLES
-from enums import FAULT_BITS, FIX_TYPES, DIFF_SOURCES
+from health_monitor import (
+    HealthMonitor, MONITORED_FIELDS, WINDOW_SECONDS, MAX_SAMPLES,
+    CMD_MOTOR,
+)
+from enums import (
+    FAULT_BITS, STATUS_BITS, FIX_TYPES, DIFF_SOURCES, CARRIER_STATUS,
+    POWER_SUPPLY_HEALTH, POWER_SUPPLY_TECHNOLOGY,
+)
 import db
+
+import logging
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("roslibpy").setLevel(logging.WARNING)  # roslibpy DEBUG dumps every raw frame - too chatty for normal runs
+logger = logging.getLogger(__name__)
+
+
+def _sanitize(value):
+    """Recursively replace float NaN/Infinity with None.
+
+    Python's json.dumps (and FastAPI's send_json) happily emit the bare
+    tokens NaN/Infinity/-Infinity - valid Python, NOT valid JSON. JS's
+    JSON.parse is strict and throws on them, so every message containing
+    one was silently dropped by the frontend's ws.onmessage (see app.js -
+    it has no try/catch around JSON.parse) and never reached the
+    isFinite() guards that were already written to handle exactly this
+    case. Real occurrence: /ublox/gnss_fix has 138/49,768 rows with
+    lat/lon = NaN in the reference bag (mostly fixType=0, before the
+    receiver has computed a position). Applied once here, at the single
+    point where telemetry is about to leave the process (both to the
+    frontend and to the DB), so every consumer downstream sees clean,
+    spec-valid JSON and the frontend's existing isFinite() handling
+    behaves as originally intended."""
+    if isinstance(value, float):
+        return None if (value != value or value in (float("inf"), float("-inf"))) else value
+    if isinstance(value, dict):
+        return {k: _sanitize(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize(v) for v in value]
+    return value
+
+
+# Bag-mode telemetry persistence is TIME-decimated (not skipped, not full
+# rate). Why not skip: db.recent_telemetry() pooled across sessions is what
+# warm_up() reads (stats AND residual replay), and list_sessions()/
+# latest_session_id() deliberately cover telemetry-only sessions - writing
+# nothing in bag mode would silently regress both on any DB without live
+# history. Why not full rate: backend/data/*.json already preserves the
+# complete replay source, so ~hundreds of thousands of rows per replay
+# would be pure duplication. Time-based (not every-Nth): an Nth-row rule is
+# replay-speed-dependent - at 1x a 1Hz topic keeps 180/50 = 4 rows per
+# 180s window, below MIN_BASELINE_SAMPLES - while one row per topic per
+# BAG_DB_WRITE_EVERY_S guarantees ~90 rows per topic per window at any
+# speed, and bounds the total telemetry write rate at ~9 rows/s regardless
+# of replay speed (vs ~470/s unbounded at 20x full rate). Live mode still
+# records every message: there the DB IS the durable record (no
+# backend/data/ equivalent), and future analysis/retraining may want full
+# rate.
+BAG_DB_WRITE_EVERY_S = 2.0
+
+
+def _db_write_due(last_writes, topic, now, every=BAG_DB_WRITE_EVERY_S):
+    """Per-topic persistence gate for decimated bag-mode writes. Returns
+    True at most once per `every` wall-clock seconds per topic (first call
+    for a topic always True), recording the write time. Pure logic, no I/O
+    - unit-tested in test_persistence.py."""
+    if now - last_writes.get(topic, 0.0) >= every:
+        last_writes[topic] = now
+        return True
+    return False
+
+
+def _log_new_coverage_warnings(health: HealthMonitor, already_logged: set):
+    """Logs health.field_coverage_warnings() to the server console only -
+    deliberately NOT sent to the frontend as a health_event (see
+    health_monitor.py's field_coverage_warnings() docstring: a field
+    that's never arrived at all is a config/schema problem discovered
+    once at the start of a session, not a robot state that changes over
+    time, so it doesn't belong in the same feed as sensor_health/comms/
+    hardware_fault). `already_logged` is a per-session set of (topic,
+    field) keys already printed - deliberately NOT keyed on the message
+    text, since field_coverage_warnings() embeds the live running message
+    count in the message for readability, which would make every call's
+    string different and defeat the dedupe. Calling this repeatedly
+    during a long live session logs each missing field exactly once."""
+    for w in health.field_coverage_warnings():
+        key = (w["topic"], w["field"])
+        if key not in already_logged:
+            logger.warning("[health coverage] %s", w["message"])
+            already_logged.add(key)
 
 
 def _warm_up_health(health: HealthMonitor):
@@ -41,7 +128,11 @@ def _warm_up_health(health: HealthMonitor):
     wall-clock recency."""
     cutoff = time.time() - WINDOW_SECONDS
     telemetry_by_topic = {}
-    for topic in MONITORED_FIELDS:
+    # MONITORED_FIELDS for the statistical baselines plus the /cmd topics
+    # for the residual-baseline replay (see HealthMonitor._warm_up_residuals
+    # - cmd rows hold the last-known command that feedback residuals are
+    # computed against).
+    for topic in list(MONITORED_FIELDS) + list(CMD_MOTOR):
         rows = db.recent_telemetry(topic, cutoff, MAX_SAMPLES)
         rows.reverse()  # oldest first, matches warm_up()'s expected order
         telemetry_by_topic[topic] = rows
@@ -50,9 +141,18 @@ def _warm_up_health(health: HealthMonitor):
 DATA_DIR = Path(__file__).parent / "data"
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
-TELEMETRY_SOURCE = os.environ.get("TELEMETRY_SOURCE", "bag").lower()
+TELEMETRY_SOURCE = os.environ.get("TELEMETRY_SOURCE", "live").lower()
 ROSBRIDGE_HOST = os.environ.get("ROSBRIDGE_HOST", "localhost")
 ROSBRIDGE_PORT = int(os.environ.get("ROSBRIDGE_PORT", "9090"))
+
+# Speed-test target - deliberately separate config from ROSBRIDGE_HOST/PORT
+# even though it defaults to the same host: network connectivity and robot
+# telemetry are tested independently (see virtual_robot/speedtest_server.py
+# and README "Connecting to the real robot"), and on the real robot these
+# could end up being genuinely different addresses/ports. Override with
+# SPEEDTEST_HOST/SPEEDTEST_PORT if so.
+SPEEDTEST_HOST = os.environ.get("SPEEDTEST_HOST", ROSBRIDGE_HOST)
+SPEEDTEST_PORT = int(os.environ.get("SPEEDTEST_PORT", "8091"))
 
 # Which dashboard panel a topic feeds. This is UI ROUTING CODE, not data -
 # it can't be discovered from a robot, since a topic name alone doesn't say
@@ -86,10 +186,18 @@ def _load_bag_topic_meta():
     for topic, fname in manifest["topics"].items():
         count = len(json.loads((DATA_DIR / fname).read_text()))
         rates[topic] = round(count / duration, 2) if duration else 0
-    topic_meta = {
-        topic: {"hz": rates.get(topic, 1), **panel}
-        for topic, panel in PANEL_MAP.items()
-    }
+    # Expose topic metadata to the dashboard. PANEL_MAP remains the
+    # specialized-dashboard routing map; the frontend decides whether a topic
+    # belongs in an existing panel or gets its own panel.
+    topic_meta = {}
+    for topic in manifest["topics"]:
+        panel = PANEL_MAP.get(topic, {})
+        topic_meta[topic] = {
+            "hz": rates.get(topic, 0),
+            "type": manifest.get("topic_msgtype", {}).get(topic, "unknown"),
+            "mode": "on_change" if topic.endswith("/cmd") else "continuous",
+            **panel,
+        }
     return topic_meta, manifest, duration
 
 
@@ -141,15 +249,41 @@ async def telemetry_ws(websocket: WebSocket):
             "speed": speed,
             "topics": BAG_TOPIC_META,
             "fault_bits": FAULT_BITS,
+            "status_bits": STATUS_BITS,
             "fix_types": FIX_TYPES,
             "diff_sources": DIFF_SOURCES,
+            "carrier_status": CARRIER_STATUS,
+            "power_supply_health": POWER_SUPPLY_HEALTH,
+            "power_supply_technology": POWER_SUPPLY_TECHNOLOGY,
         })
         await _stream_bag(websocket, speed, session_id)
 
 
 async def _stream_bag(websocket: WebSocket, speed: float, session_id: str):
+    # NOTE on speed vs. HealthMonitor's WINDOW_SECONDS: health.ingest() is
+    # always given time.time() (real wall-clock), by design - see
+    # db.recent_telemetry()'s docstring, this is what lets warm_up() and
+    # live ingestion share one consistent clock. That's the right call.
+    # The side effect: WINDOW_SECONDS=180 is 180 *wall-clock* seconds
+    # always, regardless of `speed`. At the default 20x replay speed,
+    # 180 wall-clock seconds = 3600s (1 hour) of bag time - the
+    # statistical/residual baselines are effectively 20x wider (in bag-
+    # time terms) than the README's "last 3 minutes" describes, and
+    # MANEUVER_SETTLE_SECONDS/DEAD_SENSOR_MIN_SPAN_SECONDS etc. all
+    # inherit the same stretch. This was an unexamined interaction, not a
+    # deliberate choice - flagged here and in the README rather than
+    # silently changed, since "should the window track bag-time instead
+    # of wall-clock at non-1x speed" is a design call, not a bug fix.
+    if speed != 1.0:
+        logger.info(
+            "[health] streaming bag at %sx - HealthMonitor's %ss window is wall-clock, "
+            "so it covers ~%ss of bag time at this speed, not %ss (see README 'Known limitations').",
+            speed, WINDOW_SECONDS, round(WINDOW_SECONDS * speed), WINDOW_SECONDS,
+        )
     health = HealthMonitor()
     _warm_up_health(health)
+    coverage_logged = set()
+    last_db_write = {}  # topic -> last persisted monotonic t (decimation gate)
     try:
         sim_t0 = EVENTS[0][0]
         real_t0 = time.monotonic()
@@ -164,17 +298,27 @@ async def _stream_bag(websocket: WebSocket, speed: float, session_id: str):
                 await asyncio.sleep(min(wait, 0.2))
                 continue
             rel_t = round(t - sim_t0, 3)
+            data = _sanitize(data)
             await websocket.send_json({
                 "type": "msg",
                 "topic": topic,
                 "t": rel_t,
                 "data": data,
             })
-            db.record_telemetry(session_id, "bag", topic, rel_t, data)
+            # Bag-mode persistence is time-decimated (see
+            # BAG_DB_WRITE_EVERY_S): the full-fidelity replay source already
+            # lives in backend/data/*.json; the DB keeps one row per topic
+            # per interval - enough for session visibility and warm-up, at
+            # ~1% of the write volume. Health events are all still logged.
+            if _db_write_due(last_db_write, topic, time.monotonic()):
+                db.record_telemetry(session_id, "bag", topic, rel_t, data)
             for ev in health.ingest(topic, data, time.time()):
                 db.log_event(session_id, topic, ev)
                 await websocket.send_json({"type": "health_event", **ev})
             idx += 1
+            if idx % 200 == 0:
+                _log_new_coverage_warnings(health, coverage_logged)
+        _log_new_coverage_warnings(health, coverage_logged)
         await websocket.send_json({"type": "eof"})
     except WebSocketDisconnect:
         pass
@@ -185,17 +329,34 @@ async def _stream_bag(websocket: WebSocket, speed: float, session_id: str):
             pass
 
 
+# ---- robot connection state (for gating /api/speedtest/*, see below) ----
+#
+# A counter, not a bool: nothing stops two browser tabs each opening their
+# own /ws/telemetry connection, and the speed test should stay usable as
+# long as AT LEAST ONE live session actually reached the robot - it
+# shouldn't flicker unavailable just because a second tab disconnected.
+# Only _stream_live touches this (bag mode never increments it), which is
+# exactly the "only work when connected to the robot" gate we want.
+_live_connections = 0
+
+
+def _robot_connected() -> bool:
+    return TELEMETRY_SOURCE == "live" and _live_connections > 0
+
+
 # --------------------------------------------------------------- live mode
 async def _stream_live(websocket: WebSocket, session_id: str):
     """Subscribes to the robot over rosbridge. Topic list/types come from
     the robot itself (rosapi), not from any local file. Per-topic rate is
     measured from real message arrivals and reported to the frontend once
     known - nothing here is precomputed or guessed."""
+    global _live_connections
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     arrival_times = defaultdict(lambda: deque(maxlen=10))
     health = HealthMonitor()
     _warm_up_health(health)
+    coverage_logged = set()
 
     def on_message(topic, t, data):
         loop.call_soon_threadsafe(queue.put_nowait, ("msg", topic, t, data))
@@ -205,7 +366,20 @@ async def _stream_live(websocket: WebSocket, session_id: str):
 
     source = RosLiveSource(host=ROSBRIDGE_HOST, port=ROSBRIDGE_PORT)
     try:
-        source.connect(on_message, on_topics_discovered=on_topics_discovered)
+        # Runs off the event loop: source.connect() blocks synchronously
+        # while discover_topics_stable() polls rosapi/topics until the
+        # topic set settles (see ros_live_source.py) - up to its
+        # max_wait=15s default. Calling it directly on this coroutine
+        # would stall every other WebSocket connection this worker is
+        # handling for that whole window; run_in_executor keeps this
+        # session's connect from blocking anyone else's. The on_message/
+        # on_topics_discovered callbacks are unaffected - they already run
+        # from roslibpy's own background thread and use
+        # loop.call_soon_threadsafe, which is safe from any thread.
+        await loop.run_in_executor(
+            None,
+            lambda: source.connect(on_message, on_topics_discovered=on_topics_discovered),
+        )
     except Exception as e:
         await websocket.send_json({
             "type": "error",
@@ -213,7 +387,23 @@ async def _stream_live(websocket: WebSocket, session_id: str):
         })
         return
 
+    # Only counted as "connected to the robot" once source.connect() above
+    # has actually succeeded - a failed connect (the except branch) never
+    # reaches here, so it never marks the robot as reachable.
+    _live_connections += 1
+
+    # Telemetry throughput accounting - see README "Network Speed Test vs
+    # Telemetry Throughput" for why this is a SEPARATE metric from
+    # /api/speedtest/*, not a replacement for it. This counts real ROS
+    # message payload bytes actually received over rosbridge (measured the
+    # same way arrival_times measures Hz - straight from real arrivals,
+    # nothing synthetic/guessed), reset every broadcast window so each
+    # meta_update reports "since the last update", not a cumulative total.
+    telemetry_bytes_window = 0
+    telemetry_msgs_window = 0
+
     last_rate_broadcast = 0.0
+    last_rediscover = time.monotonic()
     try:
         while True:
             kind, a, b, c = await queue.get()
@@ -223,7 +413,12 @@ async def _stream_live(websocket: WebSocket, session_id: str):
                 topics_meta = {}
                 for topic, msg_type in discovered:
                     panel = PANEL_MAP.get(topic, {})
-                    topics_meta[topic] = {"type": msg_type, "hz": None, **panel}
+                    topics_meta[topic] = {
+                        "type": msg_type,
+                        "hz": None,
+                        "mode": "on_change" if topic.endswith("/cmd") else "continuous",
+                        **panel,
+                    }
                 await websocket.send_json({
                     "type": "meta",
                     "source": "live",
@@ -232,15 +427,27 @@ async def _stream_live(websocket: WebSocket, session_id: str):
                     "speed": 1.0,
                     "topics": topics_meta,
                     "fault_bits": FAULT_BITS,
+                    "status_bits": STATUS_BITS,
                     "fix_types": FIX_TYPES,
                     "diff_sources": DIFF_SOURCES,
+                    "carrier_status": CARRIER_STATUS,
+                    "power_supply_health": POWER_SUPPLY_HEALTH,
+                    "power_supply_technology": POWER_SUPPLY_TECHNOLOGY,
                 })
                 continue
 
             # kind == "msg"
             topic, t, data = a, b, c
+            data = _sanitize(data)
             now = time.monotonic()
             arrival_times[topic].append(now)
+
+            # Byte-count the sanitized payload actually being delivered
+            # (excludes the {type, topic, t} wrapper - just the ROS
+            # message content itself, which is what a robot's own network
+            # link actually has to carry).
+            telemetry_bytes_window += len(json.dumps(data))
+            telemetry_msgs_window += 1
 
             await websocket.send_json({
                 "type": "msg",
@@ -255,9 +462,13 @@ async def _stream_live(websocket: WebSocket, session_id: str):
 
             # Every ~2s, report real observed rates (only for topics with
             # enough samples to estimate) so the frontend's stale/offline
-            # logic uses actual robot behavior, not a guess.
+            # logic uses actual robot behavior, not a guess. Telemetry
+            # throughput piggybacks on the same cadence/message, computed
+            # from the SAME real arrivals, not a separate synthetic probe.
             if now - last_rate_broadcast > 2.0:
+                elapsed = now - last_rate_broadcast if last_rate_broadcast else 2.0
                 last_rate_broadcast = now
+                _log_new_coverage_warnings(health, coverage_logged)
                 updates = {}
                 for topic, times in arrival_times.items():
                     if len(times) >= 2:
@@ -265,8 +476,42 @@ async def _stream_live(websocket: WebSocket, session_id: str):
                         if span > 0:
                             hz = round((len(times) - 1) / span, 2)
                             updates[topic] = {"hz": hz, **PANEL_MAP.get(topic, {})}
+                payload = {"type": "meta_update"}
                 if updates:
-                    await websocket.send_json({"type": "meta_update", "topics": updates})
+                    payload["topics"] = updates
+                if elapsed > 0:
+                    payload["telemetry"] = {
+                        "bytes_per_sec": round(telemetry_bytes_window / elapsed, 1),
+                        "msgs_per_sec": round(telemetry_msgs_window / elapsed, 2),
+                    }
+                telemetry_bytes_window = 0
+                telemetry_msgs_window = 0
+                if "topics" in payload or "telemetry" in payload:
+                    await websocket.send_json(payload)
+
+            # Mid-session topic discovery (see REDISCOVER_EVERY_S): a node
+            # that (re)starts after connect used to stay invisible until a
+            # full reconnect. New topics ride the meta_update path the
+            # frontend already merges (meta.topics), with hz unknown until
+            # real arrivals land - same as initial discovery.
+            if now - last_rediscover > REDISCOVER_EVERY_S:
+                last_rediscover = now
+                fresh = await loop.run_in_executor(None, source.poll_new_topics)
+                if fresh:
+                    logger.info("[live] discovered %d new topic(s) mid-session: %s",
+                                len(fresh), [t for t, _ in fresh])
+                    await websocket.send_json({
+                        "type": "meta_update",
+                        "topics": {
+                            topic: {
+                                "type": msg_type,
+                                "hz": None,
+                                "mode": "on_change" if topic.endswith("/cmd") else "continuous",
+                                **PANEL_MAP.get(topic, {}),
+                            }
+                            for topic, msg_type in fresh
+                        },
+                    })
 
     except WebSocketDisconnect:
         pass
@@ -276,7 +521,59 @@ async def _stream_live(websocket: WebSocket, session_id: str):
         except Exception:
             pass
     finally:
+        _live_connections -= 1
         source.close()
+
+
+# ---------- ML model status (read-only panel data - see Phase 5) ----------
+#
+# Serves ml/artifacts/metadata.json essentials so the dashboard's ML panel
+# can state what model is loaded, on what features/thresholds, and with
+# what validated performance - without the frontend ever learning
+# filesystem paths. Read once, served from memory (artifacts don't change
+# under a running server). Fail-soft: without built artifacts this returns
+# {"enabled": false} and the panel shows "model not loaded" - the rest of
+# the dashboard (and HealthMonitor, which guards MLScorer the same way)
+# is unaffected.
+_ml_status_cache = None
+
+
+def _load_ml_status():
+    global _ml_status_cache
+    if _ml_status_cache is not None:
+        return _ml_status_cache
+    meta_path = Path(__file__).parent.parent / "ml" / "artifacts" / "metadata.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError) as e:
+        logger.warning("[ml-status] artifacts unavailable: %s", e)
+        _ml_status_cache = {"enabled": False}
+        return _ml_status_cache
+    thr = meta.get("thresholds", {})
+    _ml_status_cache = _sanitize({
+        "enabled": True,
+        "schema_version": meta.get("schema_version"),
+        "ml_features": meta.get("ml_features", []),
+        "thresholds": {
+            "if": {k: thr.get("if", {}).get(k) for k in ("idle", "drive")},
+            "ae": {k: thr.get("ae", {}).get(k) for k in ("idle", "drive")},
+            "fusion": thr.get("fusion", ""),
+        },
+        "gate": meta.get("test_gate", {}),
+        "ae": {"window": meta.get("ae_window"),
+               "stride": meta.get("ae_stride"),
+               "arch": meta.get("ae_arch", {})},
+        "grid_hz": meta.get("grid_hz"),
+    })
+    return _ml_status_cache
+
+
+@app.get("/api/ml-status")
+async def ml_status():
+    """Model facts for the dashboard ML panel. Mode-independent (the model
+    lives backend-side, not per-connection) and safe to call before ever
+    connecting."""
+    return _load_ml_status()
 
 
 @app.get("/api/health-history")
@@ -306,6 +603,278 @@ async def sessions(limit: int = 50):
     start/end time and event count - lets a caller browse history from
     an earlier connection instead of only ever seeing the latest one."""
     return {"sessions": db.list_sessions(limit=limit)}
+
+
+@app.get("/api/report")
+async def report(session_id: str = None, format: str = "json"):
+    """Session report for review/export (Phase 5): health events, per-topic
+    telemetry coverage, ML model facts, and the detector config snapshot -
+    everything a supervisor needs to review a session without replaying it.
+
+    session_id defaults to the latest session (same rule as health-history).
+    format=json returns the machine-readable compendium; format=html returns
+    a single-file printable page (inline CSS, no JS). All robot-supplied
+    strings are HTML-escaped in the HTML variant (same XSS lesson as the
+    frontend renderers). Read-only: no writes, no streaming, no state."""
+    import html as _html
+
+    if format not in ("json", "html"):
+        return {"ok": False,
+                "error": "format must be 'json' or 'html'"}
+    if session_id in (None, "all"):
+        session_id = db.latest_session_id()
+    import health_monitor as hm
+    events = db.read_events(session_id=session_id, limit=10000)
+    by_kind = {}
+    for e in events:
+        by_kind[e.get("kind", "?")] = by_kind.get(e.get("kind", "?"), 0) + 1
+    body = {
+        "session_id": session_id,
+        "generated_at": time.time(),
+        "event_count": len(events),
+        "events_by_kind": by_kind,
+        "events": events,
+        "topics": db.session_topic_stats(session_id) if session_id else [],
+        "ml": _load_ml_status(),
+        "detector_config": {
+            "z_threshold": hm.Z_THRESHOLD,
+            "window_seconds": hm.WINDOW_SECONDS,
+            "debounce_seconds": hm.DEBOUNCE_SECONDS,
+            "min_baseline_samples": hm.MIN_BASELINE_SAMPLES,
+            "gnss_degraded_fix": sorted(hm.GNSS_DEGRADED_FIX),
+            "escalation_seconds": hm.ESCALATION_SECONDS,
+            "maneuver_settle_seconds": hm.MANEUVER_SETTLE_SECONDS,
+        },
+    }
+    if format == "json":
+        return body
+
+    def esc(v):
+        return _html.escape("" if v is None else str(v), quote=True)
+
+    def clock(ts):
+        try:
+            return time.strftime('%H:%M:%S', time.localtime(float(ts)))
+        except (TypeError, ValueError):
+            return "--:--:--"
+
+    news = [e for e in events if e.get("state") == "new"]
+    n_crit = sum(1 for e in news if e.get("severity") == "critical")
+    n_warn = sum(1 for e in news if e.get("severity") == "warning")
+    n_fail = sum(1 for e in news if e.get("kind") == "failure")
+    span = ""
+    if events and events[0].get("logged_at") and events[-1].get("logged_at"):
+        span = f"{clock(events[0]['logged_at'])} → {clock(events[-1]['logged_at'])}"
+    overall = "CRITICAL" if n_crit else ("WARNING" if n_warn else "NOMINAL")
+    ocol = {"CRITICAL": "#C62828", "WARNING": "#E07B20", "NOMINAL": "#16A34A"}[overall]
+
+    rows = "\n".join(
+        f"<tr class='{esc(e.get('severity'))} {esc(e.get('state'))}'>"
+        f"<td class='mono'>{clock(e.get('logged_at'))}</td>"
+        f"<td><span class='st'>{esc(e.get('state'))}</span></td><td>{esc(e.get('kind'))}</td>"
+        f"<td><span class='sev'>{esc(e.get('severity'))}</span></td><td><b>{esc(e.get('signal'))}</b></td>"
+        f"<td>{esc(e.get('message'))}</td></tr>"
+        for e in events
+    ) or "<tr><td colspan='6' class='empty'>No health event recorded in this session.</td></tr>"
+    trows = "\n".join(
+        f"<tr><td class='mono'>{esc(t['topic'])}</td><td class='num'>{t['messages']}</td>"
+        f"<td class='mono'>{t['first_t']} – {t['last_t']}</td></tr>"
+        for t in body["topics"]
+    )
+    kinds = "\n".join(f"<span class='chip'>{esc(k)} <b>{v}</b></span>"
+                      for k, v in sorted(by_kind.items()))
+    cfg = "\n".join(f"<tr><td class='mono'>{esc(k)}</td><td class='mono'>{esc(v)}</td></tr>"
+                    for k, v in body["detector_config"].items())
+    logo = ""
+    try:
+        import base64
+        logo_b64 = base64.b64encode((FRONTEND_DIR / "assets" / "enova.png").read_bytes()).decode()
+        logo = f"<img src='data:image/png;base64,{logo_b64}' alt='Enova Robotics'>"
+    except OSError:
+        pass
+    ml_on = body["ml"].get("enabled")
+    html_doc = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>PGuard session report {esc(session_id)}</title>
+<style>
+*{{box-sizing:border-box}}body{{font-family:'Segoe UI',system-ui,sans-serif;max-width:1100px;margin:24px auto;color:#14202E;padding:0 16px;font-size:13px}}
+.hdr{{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px;border-radius:14px;background:linear-gradient(135deg,#10182A,#162033);color:#E8EDF2;border-bottom:3px solid #00B4B4}}
+.hdr img{{height:44px;background:#fff;border-radius:6px;padding:3px 6px}}.hdr h1{{margin:0;font-size:19px;letter-spacing:.5px}}
+.hdr p{{margin:3px 0 0;color:#8FA3B8;font-size:11.5px}}.state{{padding:6px 14px;border-radius:20px;font-weight:800;letter-spacing:1px;color:#fff;background:{ocol}}}
+.cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:16px 0}}.card{{border:1px solid #D5DEE8;border-radius:12px;padding:12px;text-align:center}}
+.card .v{{font-size:24px;font-weight:800;font-family:Consolas,monospace;color:#008C8C}}.card .k{{font-size:9.5px;text-transform:uppercase;letter-spacing:1.2px;color:#5B6B7C}}
+.card.c .v{{color:#C62828}}.card.w .v{{color:#E07B20}}
+h2{{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:#008C8C;margin:22px 0 8px;border-bottom:2px solid #E3EEF0;padding-bottom:5px}}
+.chip{{display:inline-block;margin:0 6px 6px 0;padding:3px 10px;border-radius:12px;background:#EAF6F6;color:#10325A;font-size:12px}}
+table{{border-collapse:collapse;width:100%;font-size:12px}}th{{background:#10325A;color:#fff;text-align:left;padding:6px 8px;font-weight:600}}
+td{{padding:5px 8px;border-bottom:1px solid #E3E9EF;vertical-align:top}}tr:nth-child(even) td{{background:#F7FAFC}}
+tr.critical td:first-child{{border-left:4px solid #C62828}}tr.warning td:first-child{{border-left:4px solid #E07B20}}tr.cleared td{{color:#7A8896}}tr.cleared td:first-child{{border-left-color:#16A34A}}
+.sev,.st{{font-size:10px;font-weight:700;text-transform:uppercase;padding:1px 6px;border-radius:4px;background:#EEF2F6}}tr.critical .sev{{background:#FDECEC;color:#C62828}}tr.warning .sev{{background:#FFF4E8;color:#B45F14}}
+.mono{{font-family:Consolas,monospace;font-size:11.5px}}.num{{text-align:right;font-family:Consolas,monospace}}.empty{{text-align:center;color:#7A8896;padding:18px}}
+.foot{{margin-top:26px;text-align:center;color:#7A8896;font-size:11px}}
+@media print{{body{{margin:0;max-width:none}}.hdr{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}th,.state{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}tr{{break-inside:avoid}}}}
+</style></head><body>
+<div class="hdr"><div style="display:flex;align-items:center;gap:14px">{logo}<div><h1>PGuard — Session health report</h1>
+<p>Session <span class="mono">{esc(session_id)}</span> · generated {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(body['generated_at']))}{(' · events ' + span) if span else ''}</p></div></div>
+<span class="state">{overall}</span></div>
+<div class="cards">
+<div class="card"><div class="k">Events logged</div><div class="v">{len(events)}</div></div>
+<div class="card c"><div class="k">Critical (new)</div><div class="v">{n_crit}</div></div>
+<div class="card w"><div class="k">Warnings (new)</div><div class="v">{n_warn}</div></div>
+<div class="card c"><div class="k">Failure escalations</div><div class="v">{n_fail}</div></div>
+<div class="card"><div class="k">ML layer</div><div class="v" style="font-size:16px;padding-top:6px">{'ENABLED' if ml_on else 'OFF'}</div></div>
+</div>
+<h2>Events by detector</h2><div>{kinds or '<span class="chip">none</span>'}</div>
+<h2>Event log (oldest first)</h2>
+<table><tr><th>time</th><th>state</th><th>detector</th><th>severity</th><th>signal</th><th>message</th></tr>
+{rows}</table>
+<h2>Topic coverage</h2>
+<table><tr><th>topic</th><th>messages stored</th><th>stream span (s)</th></tr>
+{trows}</table>
+<h2>Detector configuration</h2>
+<table><tr><th>parameter</th><th>value</th></tr>{cfg}</table>
+<div class="foot">PGuard Robot Health Monitor · Enova Robotics · generated automatically from the dashboard database · read-only report</div>
+</body></html>"""
+    from fastapi.responses import Response
+    return Response(content=html_doc, media_type="text/html")
+
+
+# ---------- speed test (backend-proxied - see README "Connecting to the
+# real robot" and virtual_robot/speedtest_server.py) ----------
+#
+# Deliberately backend-proxied rather than browser-direct: the frontend
+# never learns the robot's address (same pattern as telemetry - it only
+# ever talks to its own backend), and this avoids needing CORS headers on
+# speedtest_server.py. Costs one extra hop (browser -> backend), which in
+# the expected setup (backend running on the same machine as the browser)
+# is loopback and doesn't meaningfully affect the measured numbers - the
+# backend->robot leg is what's actually being measured either way.
+#
+# Each call opens its own short-lived aiohttp session rather than sharing
+# one across requests - these are infrequent, user-initiated, one-shot
+# tests, not a hot path, so the simplicity is worth more than reusing a
+# connection pool here.
+
+SPEEDTEST_PING_COUNT = 4
+SPEEDTEST_DOWNLOAD_BYTES = 20_000_000
+SPEEDTEST_DOWNLOAD_MAX_SECONDS = 5
+SPEEDTEST_UPLOAD_BYTES = 10_000_000
+
+# Minimum gap between two runs of the same speed-test endpoint. Each run
+# moves tens of MB across the robot link on demand with no auth (V0 scope);
+# without a cooldown, accidental double-clicks - or a curious user
+# hammering the button - saturate the very link being measured. Returns the
+# same {"ok": false} shape as a failed transfer, so no frontend change.
+SPEEDTEST_COOLDOWN_S = 10.0
+_speedtest_last_run = {}
+
+# How often a live session re-polls rosapi for topics that appeared after
+# connect (node restart, late publisher, bag loop restart). Single poll via
+# RosLiveSource.poll_new_topics(), which subscribes to only the delta and
+# never raises - a failed poll just retries next round. New topics arrive
+# at the frontend through the existing meta_update path (hz: null until
+# the first real arrivals, same as initial discovery).
+REDISCOVER_EVERY_S = 30.0
+
+
+NOT_CONNECTED_ERROR = (
+    "Not connected to the robot - open a live connection first "
+    "(speed test only measures the current robot link, it doesn't make sense in bag mode)."
+)
+
+
+def _speedtest_gate(name):
+    """Shared pre-check for /api/speedtest/*: robot-connected AND outside
+    the per-endpoint cooldown. Returns an error string, or None to proceed
+    (recording this run's timestamp)."""
+    if not _robot_connected():
+        return NOT_CONNECTED_ERROR
+    now = time.monotonic()
+    last = _speedtest_last_run.get(name, 0.0)
+    if now - last < SPEEDTEST_COOLDOWN_S:
+        return (f"Cooldown - wait {SPEEDTEST_COOLDOWN_S - (now - last):.0f}s "
+                f"between {name} runs (each run moves tens of MB on the robot link).")
+    _speedtest_last_run[name] = now
+    return None
+
+
+@app.get("/api/speedtest/ping")
+async def speedtest_ping():
+    """Round-trip time to the speed-test target (min of several small
+    requests, same approach as the browser-direct version this replaced -
+    min rather than mean/median because we want "best case reachable
+    latency", not something inflated by one slow first-connection request
+    or GC pause."""
+    err = _speedtest_gate("ping")
+    if err:
+        return {"ok": False, "error": err}
+    url = f"http://{SPEEDTEST_HOST}:{SPEEDTEST_PORT}/ping"
+    timings_ms = []
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            for _ in range(SPEEDTEST_PING_COUNT):
+                t0 = time.perf_counter()
+                async with session.get(url) as resp:
+                    await resp.read()
+                timings_ms.append((time.perf_counter() - t0) * 1000)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "ms": min(timings_ms)}
+
+
+@app.get("/api/speedtest/download")
+async def speedtest_download():
+    """Streams SPEEDTEST_DOWNLOAD_BYTES (or SPEEDTEST_DOWNLOAD_MAX_SECONDS,
+    whichever comes first - same bounded-stream approach as the
+    browser-direct version this replaced) from the speed-test target and
+    reports throughput. Only the download itself is timed - the initial
+    connection/response-headers aren't counted against it."""
+    err = _speedtest_gate("download")
+    if err:
+        return {"ok": False, "error": err}
+    url = f"http://{SPEEDTEST_HOST}:{SPEEDTEST_PORT}/down?bytes={SPEEDTEST_DOWNLOAD_BYTES}"
+    received = 0
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(url) as resp:
+                t0 = time.perf_counter()
+                async for chunk in resp.content.iter_chunked(65536):
+                    received += len(chunk)
+                    if time.perf_counter() - t0 > SPEEDTEST_DOWNLOAD_MAX_SECONDS:
+                        break
+                elapsed = time.perf_counter() - t0
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        return {"ok": False, "error": str(e)}
+    if elapsed <= 0:
+        return {"ok": False, "error": "elapsed time was zero - transfer too fast to measure"}
+    mbps = (received * 8) / elapsed / 1_000_000
+    return {"ok": True, "mbps": mbps, "bytes": received, "seconds": elapsed}
+
+
+@app.post("/api/speedtest/upload")
+async def speedtest_upload():
+    """Generates SPEEDTEST_UPLOAD_BYTES of random data and times uploading
+    it to the speed-test target's /up endpoint. Payload is built once
+    up-front (not streamed from a generator) - at 10MB this is a trivial
+    amount of memory, and a plain bytes object keeps the timed section
+    unambiguous (upload transfer only, no interleaved data generation)."""
+    err = _speedtest_gate("upload")
+    if err:
+        return {"ok": False, "error": err}
+    url = f"http://{SPEEDTEST_HOST}:{SPEEDTEST_PORT}/up"
+    payload = os.urandom(SPEEDTEST_UPLOAD_BYTES)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            t0 = time.perf_counter()
+            async with session.post(url, data=payload) as resp:
+                await resp.read()
+            elapsed = time.perf_counter() - t0
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        return {"ok": False, "error": str(e)}
+    if elapsed <= 0:
+        return {"ok": False, "error": "elapsed time was zero - transfer too fast to measure"}
+    mbps = (SPEEDTEST_UPLOAD_BYTES * 8) / elapsed / 1_000_000
+    return {"ok": True, "mbps": mbps, "bytes": SPEEDTEST_UPLOAD_BYTES, "seconds": elapsed}
 
 
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

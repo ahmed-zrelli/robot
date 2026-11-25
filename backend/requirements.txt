@@ -3,3 +3,14 @@ uvicorn[standard]
 websockets
 rosbags
 roslibpy
+aiohttp
+
+# Phase 2 ML training (ml/train.py) + Phase 3 inference.
+# torch: CPU wheel recommended: pip install torch --index-url https://download.pytorch.org/whl/cpu
+scikit-learn
+pandas
+numpy
+torch
+onnx
+onnxruntime
+onnxscript

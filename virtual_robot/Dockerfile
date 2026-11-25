@@ -54,16 +54,37 @@ COPY msg_packages/enova_msgs /catkin_ws/src/enova_msgs
 WORKDIR /catkin_ws
 RUN /bin/bash -c "source /opt/ros/noetic/setup.bash && catkin_make"
 
+# type_agnostic_relay - plain rospy script, deliberately NOT a catkin
+# package: it decodes messages dynamically at runtime (genpy.dynamic), so
+# it needs no compiled/installed message package for any topic it relays.
+# Assumption (unverified in this container build - flagging rather than
+# silently assuming): rospy + genpy are already pulled in transitively by
+# ros-noetic-rosbridge-server/ros-noetic-rosapi above. If `docker compose
+# build` fails on `import rospy` or `import genpy.dynamic`, add
+# `ros-noetic-ros-base` (or just `ros-noetic-genpy`) to the apt-get
+# install list above and rebuild.
+COPY relay_node.py /opt/relay/relay_node.py
+RUN chmod +x /opt/relay/relay_node.py
+
+# Speed-test target (see speedtest_server.py's own docstring for why this
+# is separate from the ROS stack and started unconditionally rather than
+# from start_ros_stack.sh). Stdlib-only, no extra deps needed.
+COPY speedtest_server.py /opt/speedtest/speedtest_server.py
+RUN chmod +x /opt/speedtest/speedtest_server.py
+
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Manual-start command - run this after SSHing in, not auto-run on boot.
-# See start_ros_stack.sh for why (mirrors a robot that must be launched
-# manually rather than one whose software auto-starts).
+# Auto-run by entrypoint.sh on container start (see there). Also installed
+# as `start_robot` on PATH so it can be re-run manually over SSH if you
+# ever need to restart the ROS stack/bag playback without rebuilding.
 COPY start_ros_stack.sh /usr/local/bin/start_robot
 RUN chmod +x /usr/local/bin/start_robot
 
 # rosbridge websocket
 EXPOSE 9090
+
+# speed-test target - independent of ROS, up as soon as the container is
+EXPOSE 8091
 
 ENTRYPOINT ["/entrypoint.sh"]
