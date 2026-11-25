@@ -13,6 +13,18 @@ services:
     # something else already using 2222 on your machine.
     volumes:
       - ./bag:/bag:ro
+    # rosbridge firewall (see entrypoint.sh). Secure by default: only the
+    # Docker gateway - which is how the dashboard backend on the host is
+    # seen from inside the container - may reach :9090. To open it for
+    # debugging (e.g. Foxglove from another machine), set
+    # ROSBRIDGE_ALLOWED_SOURCES to an empty string before `docker compose up`.
+    environment:
+      ROSBRIDGE_ALLOWED_SOURCES: "${ROSBRIDGE_ALLOWED_SOURCES-172.28.0.1}"
+    cap_add:
+      - NET_ADMIN      # needed only to install the iptables rules above
+    networks:
+      robotnet:
+        ipv4_address: 172.28.0.10
     healthcheck:
       # Objective "is rosbridge actually up" signal instead of guessing a
       # sleep duration - checks the same port 9090 the backend connects to.
@@ -21,3 +33,27 @@ services:
       timeout: 3s
       retries: 20
       start_period: 5s
+
+  # Security demo only - simulates an intruder on the robot's network:
+  # connects to rosbridge from its own IP, advertises a rogue topic and
+  # injects an out-of-envelope motor command. Never starts with a plain
+  # `docker compose up`; run explicitly:
+  #   docker compose --profile attack run --rm attacker
+  attacker:
+    profiles: ["attack"]
+    image: python:3.11-slim
+    volumes:
+      - ./scratch/attacker.py:/attacker.py:ro
+    environment:
+      ROSBRIDGE_HOST: virtual-robot
+    command: sh -c "pip install -q --disable-pip-version-check roslibpy 2>/dev/null && python -u /attacker.py"
+    networks:
+      robotnet:
+        ipv4_address: 172.28.0.66
+
+networks:
+  robotnet:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1

@@ -22,54 +22,367 @@ Deliberately NOT backend/data/ - that folder stays bag-extracted
 telemetry only, and live mode must never read from it (see main.py).
 """
 import atexit
+import hashlib
 import json
+import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "dashboard.db"
+# PGUARD_DB_PATH lets tests (and multiple deployments) use their own file.
+DB_PATH = Path(os.environ.get("PGUARD_DB_PATH") or (Path(__file__).parent / "dashboard.db"))
+
+def _init_schema(conn):
+    """Create every table/index if missing (idempotent). Also used by the
+    login tests to build a throwaway database."""
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telemetry (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL,
+            source      TEXT NOT NULL,   -- 'bag' or 'live'
+            topic       TEXT NOT NULL,
+            t           REAL NOT NULL,   -- stream-relative timestamp (as sent to frontend)
+            data        TEXT NOT NULL,   -- JSON-encoded message payload
+            recorded_at REAL NOT NULL    -- wall-clock unix seconds
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_topic ON telemetry(topic)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_session ON telemetry(session_id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS health_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            topic      TEXT NOT NULL,
+            key        TEXT,
+            kind       TEXT,
+            severity   TEXT,
+            signal     TEXT,
+            message    TEXT,
+            state      TEXT NOT NULL,   -- 'new' or 'cleared'
+            logged_at  REAL NOT NULL    -- wall-clock unix seconds
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_health_events_session ON health_events(session_id)"
+    )
+    # Security configuration - edited from the dashboard's Settings page, never
+    # hardcoded. Passwords are stored only as salted PBKDF2 hashes (auth.py).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            username    TEXT PRIMARY KEY,
+            pw_hash     TEXT NOT NULL,   -- hex PBKDF2-HMAC-SHA256
+            salt        TEXT NOT NULL,   -- hex, 16 random bytes per user
+            iterations  INTEGER NOT NULL,
+            created_at  REAL NOT NULL,
+            created_by  TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dashboard_allowed_ips (
+            entry     TEXT PRIMARY KEY,   -- single IP or CIDR network, normalized
+            label     TEXT,
+            added_at  REAL NOT NULL,
+            added_by  TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trusted_ips (
+            ip        TEXT PRIMARY KEY,
+            label     TEXT,
+            added_at  REAL NOT NULL,
+            added_by  TEXT
+        )
+        """
+    )
+    # Audit trail of security-relevant actions (logins, lockouts, blocked
+    # computers, settings changes, alert acknowledgements). Append-only from
+    # the app (no API edits or deletes it) and hash-chained: each row stores
+    # sha256(previous row_hash + this row's fields), so editing or deleting
+    # any past row breaks every hash after it - see audit_verify().
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            at        REAL NOT NULL,     -- wall-clock unix seconds
+            event     TEXT NOT NULL,     -- e.g. login_ok, login_failed, alert_ack
+            level     TEXT NOT NULL,     -- 'info' or 'warning'
+            actor     TEXT,              -- username (None = not signed in)
+            ip        TEXT,
+            detail    TEXT,
+            prev_hash TEXT NOT NULL,
+            row_hash  TEXT NOT NULL
+        )
+        """
+    )
+    # Operator acknowledgements of active alerts - shared by every dashboard,
+    # kept across reloads. An ack is "open" until the alert clears, the
+    # operator undoes it, or the backend restarts (fresh monitors re-detect
+    # everything, so old acks must not silently hide a new occurrence).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alert_acks (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_key    TEXT NOT NULL,
+            kind         TEXT,
+            severity     TEXT,
+            signal       TEXT,
+            message      TEXT,
+            acked_by     TEXT,
+            acked_ip     TEXT,
+            acked_at     REAL NOT NULL,
+            resolved_at  REAL,           -- NULL = still open
+            resolved_how TEXT,           -- 'cleared' | 'alert_gone' | 'undone' | 'restart'
+            resolved_by  TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_acks_open ON alert_acks(alert_key, resolved_at)")
+    # Tunable policy + robot address, edited from Settings (see policy.py for
+    # the allowed keys, defaults and safe bounds). A key with no row = default.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,     -- JSON-encoded
+            updated_at REAL NOT NULL,
+            updated_by TEXT
+        )
+        """
+    )
+    conn.commit()
+
 
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-_conn.execute("PRAGMA journal_mode=WAL")
-_conn.execute(
-    """
-    CREATE TABLE IF NOT EXISTS telemetry (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id  TEXT NOT NULL,
-        source      TEXT NOT NULL,   -- 'bag' or 'live'
-        topic       TEXT NOT NULL,
-        t           REAL NOT NULL,   -- stream-relative timestamp (as sent to frontend)
-        data        TEXT NOT NULL,   -- JSON-encoded message payload
-        recorded_at REAL NOT NULL    -- wall-clock unix seconds
-    )
-    """
-)
-_conn.execute(
-    "CREATE INDEX IF NOT EXISTS idx_telemetry_topic ON telemetry(topic)"
-)
-_conn.execute(
-    "CREATE INDEX IF NOT EXISTS idx_telemetry_session ON telemetry(session_id)"
-)
-_conn.execute(
-    """
-    CREATE TABLE IF NOT EXISTS health_events (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        topic      TEXT NOT NULL,
-        key        TEXT,
-        kind       TEXT,
-        severity   TEXT,
-        signal     TEXT,
-        message    TEXT,
-        state      TEXT NOT NULL,   -- 'new' or 'cleared'
-        logged_at  REAL NOT NULL    -- wall-clock unix seconds
-    )
-    """
-)
-_conn.execute(
-    "CREATE INDEX IF NOT EXISTS idx_health_events_session ON health_events(session_id)"
-)
-_conn.commit()
+_init_schema(_conn)
+
+
+# ---------- users (settings writes commit immediately, not batched) ----------
+def count_users():
+    return _conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def get_user(username):
+    row = _conn.execute(
+        "SELECT username, pw_hash, salt, iterations FROM users WHERE username = ?",
+        (username,)).fetchone()
+    if row is None:
+        return None
+    return {"username": row[0], "pw_hash": row[1], "salt": row[2], "iterations": row[3]}
+
+
+def list_users():
+    rows = _conn.execute(
+        "SELECT username, created_at, created_by FROM users ORDER BY username").fetchall()
+    return [{"username": r[0], "created_at": r[1], "created_by": r[2]} for r in rows]
+
+
+def add_user(username, pw_hash, salt, iterations, created_by=None):
+    _conn.execute(
+        "INSERT INTO users (username, pw_hash, salt, iterations, created_at, created_by) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (username, pw_hash, salt, iterations, time.time(), created_by))
+    _conn.commit()
+
+
+def set_user_password(username, pw_hash, salt, iterations):
+    cur = _conn.execute(
+        "UPDATE users SET pw_hash = ?, salt = ?, iterations = ? WHERE username = ?",
+        (pw_hash, salt, iterations, username))
+    _conn.commit()
+    return cur.rowcount == 1
+
+
+def delete_user(username):
+    cur = _conn.execute("DELETE FROM users WHERE username = ?", (username,))
+    _conn.commit()
+    return cur.rowcount == 1
+
+
+# ---------- dashboard access allowlist (who may open the dashboard) ----------
+def list_dashboard_ips():
+    rows = _conn.execute(
+        "SELECT entry, label, added_at, added_by FROM dashboard_allowed_ips ORDER BY entry").fetchall()
+    return [{"entry": r[0], "label": r[1], "added_at": r[2], "added_by": r[3]} for r in rows]
+
+
+def dashboard_ip_entries():
+    return [r[0] for r in _conn.execute("SELECT entry FROM dashboard_allowed_ips").fetchall()]
+
+
+def add_dashboard_ip(entry, label=None, added_by=None):
+    _conn.execute(
+        "INSERT OR REPLACE INTO dashboard_allowed_ips (entry, label, added_at, added_by) VALUES (?, ?, ?, ?)",
+        (entry, label, time.time(), added_by))
+    _conn.commit()
+
+
+def remove_dashboard_ip(entry):
+    cur = _conn.execute("DELETE FROM dashboard_allowed_ips WHERE entry = ?", (entry,))
+    _conn.commit()
+    return cur.rowcount == 1
+
+
+# ---------- trusted IPs (Security watch allowlist) ----------
+def list_trusted_ips():
+    rows = _conn.execute(
+        "SELECT ip, label, added_at, added_by FROM trusted_ips ORDER BY ip").fetchall()
+    return [{"ip": r[0], "label": r[1], "added_at": r[2], "added_by": r[3]} for r in rows]
+
+
+def trusted_ip_set():
+    return {r[0] for r in _conn.execute("SELECT ip FROM trusted_ips").fetchall()}
+
+
+def add_trusted_ip(ip, label=None, added_by=None):
+    _conn.execute(
+        "INSERT OR REPLACE INTO trusted_ips (ip, label, added_at, added_by) VALUES (?, ?, ?, ?)",
+        (ip, label, time.time(), added_by))
+    _conn.commit()
+
+
+def remove_trusted_ip(ip):
+    cur = _conn.execute("DELETE FROM trusted_ips WHERE ip = ?", (ip,))
+    _conn.commit()
+    return cur.rowcount == 1
+
+
+# ---------- settings (key/value; validation lives in policy.py) ----------
+def settings_all():
+    rows = _conn.execute("SELECT key, value, updated_at, updated_by FROM settings").fetchall()
+    return {k: {"value": json.loads(v), "updated_at": at, "updated_by": by} for k, v, at, by in rows}
+
+
+def setting_put(key, value, by=None):
+    _conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)",
+                  (key, json.dumps(value), time.time(), by))
+    _conn.commit()
+
+
+def setting_delete(key):
+    cur = _conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+    _conn.commit()
+    return cur.rowcount == 1
+
+
+# ---------- audit log (hash-chained, append-only) ----------
+_audit_lock = threading.Lock()
+AUDIT_GENESIS = "0" * 64
+
+
+def _audit_hash(prev_hash, at, event, level, actor, ip, detail):
+    payload = "|".join([prev_hash, f"{at:.6f}", event, level, actor or "", ip or "", detail or ""])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def audit_append(event, actor=None, ip=None, detail=None, level="info"):
+    """Append one audit row and commit at once (a security record must not
+    sit in the write batch). Never raises: auditing must not break login."""
+    try:
+        with _audit_lock:
+            row = _conn.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+            prev = row[0] if row else AUDIT_GENESIS
+            at = time.time()
+            h = _audit_hash(prev, at, event, level, actor, ip, detail)
+            _conn.execute(
+                "INSERT INTO audit_log (at, event, level, actor, ip, detail, prev_hash, row_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (at, event, level, actor, ip, detail, prev, h))
+            _conn.commit()
+    except Exception:
+        pass
+
+
+def audit_list(limit=200, level=None):
+    """Most recent first."""
+    where, params = "", []
+    if level:
+        where, params = "WHERE level = ?", [level]
+    rows = _conn.execute(
+        f"SELECT id, at, event, level, actor, ip, detail FROM audit_log {where} ORDER BY id DESC LIMIT ?",
+        (*params, limit)).fetchall()
+    cols = ("id", "at", "event", "level", "actor", "ip", "detail")
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def audit_verify():
+    """Recompute the whole chain. Returns {ok, count, broken_at, reason}:
+    broken_at is the first row id whose stored hash no longer matches
+    (edited row) or whose prev_hash doesn't link (deleted/inserted row)."""
+    prev = AUDIT_GENESIS
+    count = 0
+    last_id = 0
+    for rid, at, event, level, actor, ip, detail, prev_hash, row_hash in _conn.execute(
+            "SELECT id, at, event, level, actor, ip, detail, prev_hash, row_hash FROM audit_log ORDER BY id"):
+        if prev_hash != prev:
+            return {"ok": False, "count": count, "broken_at": rid,
+                    "reason": f"row {rid} does not follow row {last_id} (a row was deleted or inserted)"}
+        if _audit_hash(prev_hash, at, event, level, actor, ip, detail) != row_hash:
+            return {"ok": False, "count": count, "broken_at": rid,
+                    "reason": f"row {rid} was modified after it was written"}
+        prev, last_id, count = row_hash, rid, count + 1
+    return {"ok": True, "count": count, "broken_at": None, "reason": None}
+
+
+# ---------- alert acknowledgements ----------
+_ACK_COLS = ("id", "alert_key", "kind", "severity", "signal", "message",
+             "acked_by", "acked_ip", "acked_at", "resolved_at", "resolved_how", "resolved_by")
+
+
+def acks_open():
+    rows = _conn.execute(
+        f"SELECT {', '.join(_ACK_COLS)} FROM alert_acks WHERE resolved_at IS NULL ORDER BY acked_at").fetchall()
+    return [dict(zip(_ACK_COLS, r)) for r in rows]
+
+
+def acks_recent(limit=50):
+    rows = _conn.execute(
+        f"SELECT {', '.join(_ACK_COLS)} FROM alert_acks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(zip(_ACK_COLS, r)) for r in rows]
+
+
+def ack_open(key, info, user, ip):
+    """Open an ack for `key`. False if one is already open (someone else
+    acknowledged it first - theirs stands)."""
+    if _conn.execute("SELECT 1 FROM alert_acks WHERE alert_key = ? AND resolved_at IS NULL",
+                     (key,)).fetchone():
+        return False
+    _conn.execute(
+        "INSERT INTO alert_acks (alert_key, kind, severity, signal, message, acked_by, acked_ip, acked_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (key, info.get("kind"), info.get("severity"), info.get("signal"), info.get("message"),
+         user, ip, time.time()))
+    _conn.commit()
+    return True
+
+
+def ack_resolve(key, how, by=None):
+    cur = _conn.execute(
+        "UPDATE alert_acks SET resolved_at = ?, resolved_how = ?, resolved_by = ? "
+        "WHERE alert_key = ? AND resolved_at IS NULL", (time.time(), how, by, key))
+    _conn.commit()
+    return cur.rowcount
+
+
+def acks_resolve_all(how):
+    cur = _conn.execute(
+        "UPDATE alert_acks SET resolved_at = ?, resolved_how = ? WHERE resolved_at IS NULL",
+        (time.time(), how))
+    _conn.commit()
+    return cur.rowcount
 
 
 # Write batching: the streaming loops call record_telemetry/log_event

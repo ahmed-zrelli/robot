@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-catkin-tools \
     build-essential \
     openssh-server \
+    iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # SSH access - so you can log into the "robot" like a real remote machine

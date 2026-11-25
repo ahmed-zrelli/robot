@@ -339,6 +339,98 @@ class TestLivenessSeesBriefChanges(unittest.TestCase):
         self.assertTrue(self._drive(lambda t: 57.0))
 
 
+class TestSecurityWatch(unittest.TestCase):
+    def setUp(self):
+        self._env = os.environ.pop("SECURITY_TRUSTED_IPS", None)
+
+    def tearDown(self):
+        if self._env is not None:
+            os.environ["SECURITY_TRUSTED_IPS"] = self._env
+
+    @staticmethod
+    def clients(*ips):
+        return {"clients": [{"ip_address": ip, "connection_time": {"secs": 0, "nsecs": 0}} for ip in ips]}
+
+    def test_first_snapshot_is_trusted_then_unknown_ip_fires_and_clears(self):
+        mon = HealthMonitor()
+        self.assertEqual(mon.ingest("/connected_clients", self.clients("172.18.0.1"), 1000.0), [])
+        new = mon.ingest("/connected_clients", self.clients("172.18.0.1", "172.18.0.5"), 1001.0)
+        self.assertEqual([(e["key"], e["kind"], e["severity"], e["state"]) for e in new],
+                         [("security:client:172.18.0.5", "security", "critical", "new")])
+        gone = mon.ingest("/connected_clients", self.clients("172.18.0.1"), 1002.0)
+        self.assertEqual([(e["key"], e["state"]) for e in gone], [("security:client:172.18.0.5", "cleared")])
+
+    def test_env_allowlist_overrides_first_snapshot(self):
+        os.environ["SECURITY_TRUSTED_IPS"] = "10.0.0.2, 10.0.0.3"
+        try:
+            mon = HealthMonitor()
+            evs = mon.ingest("/connected_clients", self.clients("10.0.0.2", "10.0.0.9"), 1000.0)
+            self.assertEqual([e["key"] for e in evs], ["security:client:10.0.0.9"])
+        finally:
+            del os.environ["SECURITY_TRUSTED_IPS"]
+
+    def test_settings_list_wins_and_applies_live(self):
+        # Operator-managed list (Settings page / DB) has priority over the
+        # env var and the session-start snapshot, and is re-read each update.
+        os.environ["SECURITY_TRUSTED_IPS"] = "10.0.0.2"
+        managed = {"172.28.0.1"}
+        try:
+            mon = HealthMonitor(trusted_ips_provider=lambda: managed)
+            evs = mon.ingest("/connected_clients", self.clients("172.28.0.1", "172.28.0.66"), 1000.0)
+            self.assertEqual([(e["key"], e["state"]) for e in evs], [("security:client:172.28.0.66", "new")])
+            self.assertIn("Settings list", evs[0]["message"])
+            managed.add("172.28.0.66")  # operator trusts it in Settings
+            evs = mon.ingest("/connected_clients", self.clients("172.28.0.1", "172.28.0.66"), 1001.0)
+            self.assertEqual([(e["key"], e["state"]) for e in evs], [("security:client:172.28.0.66", "cleared")])
+        finally:
+            del os.environ["SECURITY_TRUSTED_IPS"]
+
+    def test_empty_settings_list_falls_back(self):
+        mon = HealthMonitor(trusted_ips_provider=lambda: set())
+        self.assertEqual(mon.ingest("/connected_clients", self.clients("172.28.0.1"), 1000.0), [])
+        evs = mon.ingest("/connected_clients", self.clients("172.28.0.1", "172.28.0.9"), 1001.0)
+        self.assertIn("clients at session start", evs[0]["message"])
+
+    def test_out_of_envelope_command_fires_normal_does_not(self):
+        mon = HealthMonitor()
+        quiet = mon.ingest("/left/front/cmd", {"commanded_velocity": 212.0}, 1000.0)  # max ever commanded
+        self.assertFalse([e for e in quiet if e["kind"] == "security"])
+        sec = lambda cv, t: [(e["key"], e["state"]) for e in
+                             mon.ingest("/left/front/cmd", {"commanded_velocity": cv}, t)
+                             if e["kind"] == "security"]
+        self.assertEqual(sec(-900.0, 1001.0), [("security:cmd:left_front", "new")])
+        # Live-demo regression: the planner's next normal command arrives
+        # milliseconds later - the incident must NOT clear (it used to flicker).
+        self.assertEqual(sec(10.0, 1001.05), [])
+        self.assertEqual(sec(900.0, 1002.0), [])          # repeated injection: still one incident
+        self.assertEqual(sec(10.0, 1050.0), [])           # < 60 s since last bad command
+        self.assertEqual(sec(10.0, 1062.5), [("security:cmd:left_front", "cleared")])
+
+    def test_new_topic_mid_session_fires_once_baseline_and_relay_ignored(self):
+        mon = HealthMonitor()
+        self.assertEqual(mon.check_new_topics(["/hack"], 999.0), [])  # no baseline yet: nothing judged
+        mon.set_topic_baseline(["/battery/state", "/left/front/cmd"])
+        evs = mon.check_new_topics(["/battery/state", "/relay/x", "/rosout", "/hack/cmd"], 1000.0)
+        self.assertEqual([(e["key"], e["severity"]) for e in evs], [("security:topic:/hack/cmd", "warning")])
+        self.assertEqual(mon.check_new_topics(["/hack/cmd"], 1031.0), [])  # not re-raised
+
+    def test_reference_bag_never_exceeds_command_envelope(self):
+        # The limit is data-derived; guard that it stays above every
+        # command actually recorded, so security never fires on normal ops.
+        import json
+        from pathlib import Path
+        from health_monitor import SECURITY_MAX_CMD_RAD_S
+        data = Path(__file__).parent / "data"
+        if not (data / "left_front_cmd.json").exists():
+            self.skipTest("backend/data not extracted")
+        for m in ("left_front", "left_rear", "right_front", "right_rear"):
+            with open(data / f"{m}_cmd.json", encoding="utf-8") as f:
+                rows = json.load(f)
+            mx = max(abs(r["commanded_velocity"]) for r in rows
+                     if isinstance(r.get("commanded_velocity"), (int, float)))
+            self.assertLess(mx, SECURITY_MAX_CMD_RAD_S, m)
+
+
 class TestCommsExemptTopics(unittest.TestCase):
     def _run(self, quiet_topic):
         # quiet_topic publishes at 10Hz for 3s, then goes silent while a

@@ -1,6 +1,24 @@
 #!/bin/bash
 set -e
 
+# rosbridge firewall (prevention layer of the security setup). rosbridge has
+# no authentication of its own: anyone who can reach :9090 can read every
+# topic and publish motor commands. ROSBRIDGE_ALLOWED_SOURCES is a comma
+# list of IPs/CIDRs allowed to connect; everything else gets a TCP reset
+# (REJECT, so a refused client fails fast and visibly instead of hanging).
+# Empty = open (dev only). Needs cap_add NET_ADMIN (docker-compose.yml).
+if [ -n "${ROSBRIDGE_ALLOWED_SOURCES}" ]; then
+  iptables -F INPUT
+  iptables -A INPUT -p tcp --dport 9090 -s 127.0.0.1 -j ACCEPT   # in-container healthcheck
+  for src in ${ROSBRIDGE_ALLOWED_SOURCES//,/ }; do
+    iptables -A INPUT -p tcp --dport 9090 -s "$src" -j ACCEPT
+  done
+  iptables -A INPUT -p tcp --dport 9090 -j REJECT --reject-with tcp-reset
+  echo "[virtual_robot] rosbridge firewall ON - :9090 allowed only from: ${ROSBRIDGE_ALLOWED_SOURCES}"
+else
+  echo "[virtual_robot] rosbridge firewall OFF - :9090 open to every client (dev mode)"
+fi
+
 # Speed-test target - independent lifecycle, up as soon as the container is.
 python3 /opt/speedtest/speedtest_server.py &
 

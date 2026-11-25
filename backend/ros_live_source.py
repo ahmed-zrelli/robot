@@ -39,6 +39,18 @@ import roslibpy
 
 RELAY_PREFIX = "/relay"
 
+# Topics always subscribed DIRECTLY, never via the relay: rosbridge itself
+# owns their message type (no md5/package mismatch possible), and they are
+# latched - a direct subscription delivers the current value immediately,
+# whereas the relay only forwards later changes. /connected_clients feeds
+# the security watch (who is connected to the robot right now).
+DIRECT_TOPICS = {"/connected_clients"}
+
+
+def _relay_handles(topic, relayed_originals):
+    """True if `topic` should be read through its /relay/ copy."""
+    return topic in relayed_originals and topic not in DIRECT_TOPICS
+
 
 class RosLiveSource:
     """Wraps a roslibpy connection. on_message(topic, t, data) is called
@@ -185,9 +197,11 @@ class RosLiveSource:
             self._subscribed_topics.add(topic)
             if topic.startswith(RELAY_PREFIX + "/"):
                 original = topic[len(RELAY_PREFIX):]
+                if original in DIRECT_TOPICS:
+                    continue  # read directly instead (see DIRECT_TOPICS)
                 self._subscribe_relay(topic, self._on_message)
                 fresh.append((original, types_by_topic.get(original, "unknown")))
-            elif topic in relayed_originals:
+            elif _relay_handles(topic, relayed_originals):
                 # A relay is handling this topic under /relay/<topic> -
                 # the raw subscription would just hang on the same
                 # md5 mismatch or missing-package error relay_node.py
@@ -215,7 +229,7 @@ class RosLiveSource:
             t[len(RELAY_PREFIX):]
             for t, _ in discovered
             if t.startswith(RELAY_PREFIX + "/")
-        }
+        } - DIRECT_TOPICS
 
         if on_topics_discovered:
             # Present relayed topics under their ORIGINAL name/type here too,
@@ -233,6 +247,8 @@ class RosLiveSource:
         for topic, msg_type in discovered:
             self._subscribed_topics.add(topic)
             if topic.startswith(RELAY_PREFIX + "/"):
+                if topic[len(RELAY_PREFIX):] in DIRECT_TOPICS:
+                    continue  # read directly instead (see DIRECT_TOPICS)
                 self._subscribe_relay(topic, on_message)
                 continue
             if topic in relayed_originals:
@@ -255,3 +271,15 @@ class RosLiveSource:
         self._on_message = None
         if self.client.is_connected:
             self.client.close()
+        else:
+            # Never connected (wrong address, robot off): roslibpy's factory
+            # is a ReconnectingClientFactory and would keep retrying in the
+            # shared Twisted reactor for the life of the process. Every
+            # failed dashboard attempt used to leak one such retry loop, until
+            # the reactor was too busy to connect anywhere. stopTrying() must
+            # run on the reactor thread.
+            try:
+                from twisted.internet import reactor
+                reactor.callFromThread(self.client.factory.stopTrying)
+            except Exception:
+                pass

@@ -25,7 +25,8 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 import aiohttp
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ros_live_source import RosLiveSource
@@ -142,17 +143,16 @@ DATA_DIR = Path(__file__).parent / "data"
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
 TELEMETRY_SOURCE = os.environ.get("TELEMETRY_SOURCE", "live").lower()
-ROSBRIDGE_HOST = os.environ.get("ROSBRIDGE_HOST", "localhost")
-ROSBRIDGE_PORT = int(os.environ.get("ROSBRIDGE_PORT", "9090"))
-
-# Speed-test target - deliberately separate config from ROSBRIDGE_HOST/PORT
-# even though it defaults to the same host: network connectivity and robot
-# telemetry are tested independently (see virtual_robot/speedtest_server.py
-# and README "Connecting to the real robot"), and on the real robot these
-# could end up being genuinely different addresses/ports. Override with
-# SPEEDTEST_HOST/SPEEDTEST_PORT if so.
-SPEEDTEST_HOST = os.environ.get("SPEEDTEST_HOST", ROSBRIDGE_HOST)
-SPEEDTEST_PORT = int(os.environ.get("SPEEDTEST_PORT", "8091"))
+# Robot address (rosbridge host/port + speed-test port): Settings page ->
+# DB `settings`, falling back to ROSBRIDGE_HOST / ROSBRIDGE_PORT /
+# SPEEDTEST_HOST / SPEEDTEST_PORT env vars, then localhost:9090 / 8091.
+# Read per connection via policy.robot() - never cached at import - so a
+# change from Settings applies to the next connection, and open live
+# connections are told to reconnect (see _reconnect_live_sessions).
+# The speed test is still configured separately from telemetry (its own
+# port, and SPEEDTEST_HOST can pin it to another machine): network
+# connectivity and robot telemetry are tested independently.
+import policy  # noqa: E402
 
 # Which dashboard panel a topic feeds. This is UI ROUTING CODE, not data -
 # it can't be discovered from a robot, since a topic name alone doesn't say
@@ -221,10 +221,185 @@ else:
 
 app = FastAPI()
 
+# ---------- dashboard login (see auth.py; on as soon as one account exists in the DB) ----------
+import auth  # noqa: E402
+
+app.middleware("http")(auth.require_login)
+
+
+@app.get("/login")
+async def login_form():
+    if not auth.enabled():
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/", status_code=303)
+    return auth.login_page()
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    return await auth.handle_login(request)
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    return auth.handle_logout(request)
+
+
+@app.get("/api/auth-status")
+async def auth_status(request: Request):
+    return {"enabled": auth.enabled(),
+            "logged_in": auth.valid_token(request.cookies.get(auth.COOKIE)),
+            "user": auth.current_user(request)}
+
+
+# Settings (accounts + Security-watch trusted IPs), stored in SQLite and
+# managed from frontend/settings.html. All behind the login middleware.
+@app.get("/api/settings")
+async def settings_get(request: Request):
+    return auth.settings_state(request)
+
+
+@app.post("/api/settings/password")
+async def settings_password(request: Request):
+    return await auth.change_password(request)
+
+
+@app.post("/api/settings/users")
+async def settings_add_user(request: Request):
+    return await auth.add_user(request)
+
+
+@app.delete("/api/settings/users/{username}")
+async def settings_delete_user(request: Request, username: str):
+    return auth.delete_user(request, username)
+
+
+@app.post("/api/settings/trusted-ips")
+async def settings_add_ip(request: Request):
+    return await auth.add_trusted_ip(request)
+
+
+@app.delete("/api/settings/trusted-ips/{ip}")
+async def settings_remove_ip(request: Request, ip: str):
+    return auth.remove_trusted_ip(request, ip)
+
+
+@app.post("/api/settings/dashboard-ips")
+async def settings_add_dashboard_ip(request: Request):
+    return await auth.add_dashboard_ip(request)
+
+
+@app.delete("/api/settings/dashboard-ips/{entry:path}")
+async def settings_remove_dashboard_ip(request: Request, entry: str):
+    # {entry:path} because CIDR entries contain '/' (e.g. 192.168.1.0/24)
+    return auth.remove_dashboard_ip(request, entry)
+
+
+# Policy (login limits, Security-watch limits) and robot address - DB-stored,
+# validated against safe bounds in policy.py, every change audited.
+@app.get("/api/settings/policy")
+async def settings_policy_get():
+    return auth.policy_state()
+
+
+@app.post("/api/settings/policy")
+async def settings_policy_update(request: Request):
+    return await auth.update_policy(request)
+
+
+@app.delete("/api/settings/policy/{key}")
+async def settings_policy_reset(request: Request, key: str):
+    return auth.reset_policy(request, key)
+
+
+@app.post("/api/settings/robot")
+async def settings_robot_update(request: Request):
+    r = await auth.update_robot(request)
+    if isinstance(r, dict) and r.get("ok"):
+        r["reconnected"] = _reconnect_live_sessions(r["robot"])
+    return r
+
+
+@app.delete("/api/settings/robot")
+async def settings_robot_reset(request: Request):
+    r = auth.reset_robot(request)
+    r["reconnected"] = _reconnect_live_sessions(r["robot"])
+    return r
+
+
+@app.post("/api/settings/robot/test")
+async def settings_robot_test(request: Request):
+    """Try a TCP connection to the given (not yet saved) address, so an
+    operator can check it before switching every dashboard to it. Behind
+    the login; only a connect, nothing is sent."""
+    host, port, _st, problem = await auth.parse_robot_body(request)
+    if problem:
+        return JSONResponse({"ok": False, "error": problem}, status_code=400)
+    t0 = time.monotonic()
+    try:
+        _r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=3.0)
+        w.close()
+        return {"ok": True, "reachable": True, "ms": round((time.monotonic() - t0) * 1000, 1)}
+    except Exception as e:
+        return {"ok": True, "reachable": False, "error": type(e).__name__ + (f": {e}" if str(e) else "")}
+
+
+# Alert acknowledgements (shared between operators, stored in the DB) and the
+# hash-chained audit log, both behind the login middleware.
+@app.get("/api/acks")
+async def acks_get():
+    return auth.acks_state()
+
+
+@app.post("/api/acks")
+async def acks_add(request: Request):
+    return await auth.ack_alert(request)
+
+
+@app.delete("/api/acks/{key:path}")
+async def acks_remove(request: Request, key: str):
+    # {key:path}: alert keys contain '/' (topic names)
+    return auth.unack_alert(request, key)
+
+
+@app.get("/api/audit")
+async def audit_get(request: Request):
+    return auth.audit_state(request)
+
+
+auth.bootstrap_from_env()
+# Monitors start fresh on every backend start and re-detect whatever is
+# still wrong, so acks from the previous run must not hide those alerts.
+_stale_acks = db.acks_resolve_all("restart")
+auth.audit("server_started", detail=f"telemetry source {TELEMETRY_SOURCE}"
+           + (f"; {_stale_acks} open acknowledgement(s) closed" if _stale_acks else ""))
+if not auth.enabled():
+    logger.warning("[auth] no operator account yet - dashboard is open to anyone who can reach it; "
+                   "create one from Settings")
+
+
+def _log_event(session_id, topic, ev):
+    """Persist a health event and keep the shared acknowledgement state in
+    step with it (an ack closes once no open dashboard has that alert)."""
+    db.log_event(session_id, topic, ev)
+    auth.note_alert(session_id, ev)
+
 
 @app.websocket("/ws/telemetry")
 async def telemetry_ws(websocket: WebSocket):
+    peer = websocket.client.host if websocket.client else "?"
+    if not auth.ip_allowed(peer):
+        # Refuse the handshake itself (never accepted, no reason sent): a
+        # blocked computer learns nothing about what runs here.
+        auth.note_blocked(peer, "WebSocket /ws/telemetry")
+        await websocket.close()
+        return
     await websocket.accept()
+    if not auth.valid_token(websocket.cookies.get(auth.COOKIE)):
+        # Accept-then-close so the browser sees code 1008 (policy) and can
+        # send the operator to /login, instead of an opaque handshake error.
+        await websocket.close(code=1008, reason="authentication required")
+        return
 
     session_id = uuid.uuid4().hex  # one per connection - isolates this
     # connection's telemetry/health rows in the DB from every other
@@ -238,6 +413,13 @@ async def telemetry_ws(websocket: WebSocket):
         except ValueError:
             pass
 
+    try:
+        await _stream_session(websocket, session_id, speed)
+    finally:
+        auth.end_alert_session(session_id)
+
+
+async def _stream_session(websocket: WebSocket, session_id: str, speed: float):
     if TELEMETRY_SOURCE == "live":
         await _stream_live(websocket, session_id)
     else:
@@ -280,7 +462,8 @@ async def _stream_bag(websocket: WebSocket, speed: float, session_id: str):
             "so it covers ~%ss of bag time at this speed, not %ss (see README 'Known limitations').",
             speed, WINDOW_SECONDS, round(WINDOW_SECONDS * speed), WINDOW_SECONDS,
         )
-    health = HealthMonitor()
+    health = HealthMonitor(trusted_ips_provider=db.trusted_ip_set,
+                           security_limits_provider=policy.security_limits)
     _warm_up_health(health)
     coverage_logged = set()
     last_db_write = {}  # topic -> last persisted monotonic t (decimation gate)
@@ -313,7 +496,7 @@ async def _stream_bag(websocket: WebSocket, speed: float, session_id: str):
             if _db_write_due(last_db_write, topic, time.monotonic()):
                 db.record_telemetry(session_id, "bag", topic, rel_t, data)
             for ev in health.ingest(topic, data, time.time()):
-                db.log_event(session_id, topic, ev)
+                _log_event(session_id, topic, ev)
                 await websocket.send_json({"type": "health_event", **ev})
             idx += 1
             if idx % 200 == 0:
@@ -338,6 +521,15 @@ async def _stream_bag(websocket: WebSocket, speed: float, session_id: str):
 # Only _stream_live touches this (bag mode never increments it), which is
 # exactly the "only work when connected to the robot" gate we want.
 _live_connections = 0
+_live_queues = {}   # session_id -> its event queue, to push a "reconnect" into
+
+
+def _reconnect_live_sessions(new_robot):
+    msg = (f"Robot address changed to {new_robot['host']}:{new_robot['port']} in Settings - "
+           f"reconnecting.")
+    for q in list(_live_queues.values()):
+        q.put_nowait(("reconnect", msg, None, None))
+    return len(_live_queues)
 
 
 def _robot_connected() -> bool:
@@ -354,7 +546,8 @@ async def _stream_live(websocket: WebSocket, session_id: str):
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     arrival_times = defaultdict(lambda: deque(maxlen=10))
-    health = HealthMonitor()
+    health = HealthMonitor(trusted_ips_provider=db.trusted_ip_set,
+                           security_limits_provider=policy.security_limits)
     _warm_up_health(health)
     coverage_logged = set()
 
@@ -364,7 +557,8 @@ async def _stream_live(websocket: WebSocket, session_id: str):
     def on_topics_discovered(discovered):
         loop.call_soon_threadsafe(queue.put_nowait, ("discovered", discovered, None, None))
 
-    source = RosLiveSource(host=ROSBRIDGE_HOST, port=ROSBRIDGE_PORT)
+    robot = policy.robot()
+    source = RosLiveSource(host=robot["host"], port=robot["port"])
     try:
         # Runs off the event loop: source.connect() blocks synchronously
         # while discover_topics_stable() polls rosapi/topics until the
@@ -381,9 +575,10 @@ async def _stream_live(websocket: WebSocket, session_id: str):
             lambda: source.connect(on_message, on_topics_discovered=on_topics_discovered),
         )
     except Exception as e:
+        source.close()  # stop roslibpy's background retries for this failed client
         await websocket.send_json({
             "type": "error",
-            "message": f"Could not reach virtual robot at {ROSBRIDGE_HOST}:{ROSBRIDGE_PORT} - {e}",
+            "message": f"Could not reach the robot at {robot['host']}:{robot['port']} - {e}",
         })
         return
 
@@ -391,6 +586,7 @@ async def _stream_live(websocket: WebSocket, session_id: str):
     # has actually succeeded - a failed connect (the except branch) never
     # reaches here, so it never marks the robot as reachable.
     _live_connections += 1
+    _live_queues[session_id] = queue
 
     # Telemetry throughput accounting - see README "Network Speed Test vs
     # Telemetry Throughput" for why this is a SEPARATE metric from
@@ -408,8 +604,20 @@ async def _stream_live(websocket: WebSocket, session_id: str):
         while True:
             kind, a, b, c = await queue.get()
 
+            if kind == "reconnect":
+                # Robot address changed in Settings: tell the operator why,
+                # then close with 1012 (service restart). The dashboard
+                # treats it as a dropped link and reconnects by itself -
+                # to the new address, since every connection reads it fresh.
+                await websocket.send_json({"type": "error", "message": a})
+                await websocket.close(code=1012, reason="robot address changed")
+                return
+
             if kind == "discovered":
                 discovered = a  # list of (topic, type)
+                # Security watch: what exists at session start is the
+                # reference; anything appearing later is flagged.
+                health.set_topic_baseline([t for t, _ in discovered])
                 topics_meta = {}
                 for topic, msg_type in discovered:
                     panel = PANEL_MAP.get(topic, {})
@@ -457,7 +665,7 @@ async def _stream_live(websocket: WebSocket, session_id: str):
             })
             db.record_telemetry(session_id, "live", topic, t, data)
             for ev in health.ingest(topic, data, time.time()):
-                db.log_event(session_id, topic, ev)
+                _log_event(session_id, topic, ev)
                 await websocket.send_json({"type": "health_event", **ev})
 
             # Every ~2s, report real observed rates (only for topics with
@@ -512,6 +720,9 @@ async def _stream_live(websocket: WebSocket, session_id: str):
                             for topic, msg_type in fresh
                         },
                     })
+                    for ev in health.check_new_topics([t for t, _ in fresh], time.time()):
+                        _log_event(session_id, ev["signal"], ev)
+                        await websocket.send_json({"type": "health_event", **ev})
 
     except WebSocketDisconnect:
         pass
@@ -522,6 +733,7 @@ async def _stream_live(websocket: WebSocket, session_id: str):
             pass
     finally:
         _live_connections -= 1
+        _live_queues.pop(session_id, None)
         source.close()
 
 
@@ -808,7 +1020,8 @@ async def speedtest_ping():
     err = _speedtest_gate("ping")
     if err:
         return {"ok": False, "error": err}
-    url = f"http://{SPEEDTEST_HOST}:{SPEEDTEST_PORT}/ping"
+    r = policy.robot()
+    url = f"http://{r['speedtest_host']}:{r['speedtest_port']}/ping"
     timings_ms = []
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
@@ -832,7 +1045,8 @@ async def speedtest_download():
     err = _speedtest_gate("download")
     if err:
         return {"ok": False, "error": err}
-    url = f"http://{SPEEDTEST_HOST}:{SPEEDTEST_PORT}/down?bytes={SPEEDTEST_DOWNLOAD_BYTES}"
+    r = policy.robot()
+    url = f"http://{r['speedtest_host']}:{r['speedtest_port']}/down?bytes={SPEEDTEST_DOWNLOAD_BYTES}"
     received = 0
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -861,7 +1075,8 @@ async def speedtest_upload():
     err = _speedtest_gate("upload")
     if err:
         return {"ok": False, "error": err}
-    url = f"http://{SPEEDTEST_HOST}:{SPEEDTEST_PORT}/up"
+    r = policy.robot()
+    url = f"http://{r['speedtest_host']}:{r['speedtest_port']}/up"
     payload = os.urandom(SPEEDTEST_UPLOAD_BYTES)
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:

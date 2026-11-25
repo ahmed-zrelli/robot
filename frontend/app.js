@@ -17,13 +17,14 @@ let healthHistory = [];           // every health event seen in the CURRENT sess
 const $ = (id) => document.getElementById(id);
 
 // Operator-side UI state (display only - never sent to the backend).
-const ackKeys = new Set();        // active alert keys the operator acknowledged
+const ackKeys = new Set();        // active alert keys acknowledged by an operator (mirror of the DB)
+const ackInfo = new Map();        // key -> {acked_by, acked_at}; source of truth is /api/acks (shared by every dashboard)
 let selectedAlert = null;         // event object shown in the Alert details panel
 const timelineSamples = [];       // 1 Hz overall-state samples for the state timeline
 
 // ---------- connection controls ----------
 
-$("connectBtn").addEventListener("click", connect);
+$("connectBtn").addEventListener("click", () => connect()); // not `connect` directly: the click event would be taken as isRetry
 $("disconnectBtn").addEventListener("click", () => disconnect("user"));
 $("healthHistoryToggle").addEventListener("click", () => $("healthHistory").classList.toggle("collapsed"));
 document.querySelectorAll(".filter-chip").forEach(b =>
@@ -52,10 +53,26 @@ $("exportHtml").addEventListener("click", (ev) => {
 loadHealthHistory(); // populate from backend log immediately, even before Connect is clicked
                       // (no session_id yet - backend defaults to the most recent session)
 
+function goToLogin() {
+  if (window.location && typeof window.location.assign === "function") window.location.assign("/login");
+}
+
+// Show "Sign out" only when the backend has login enabled (auth.py);
+// accounts and trusted IPs are managed on /settings.html.
+(async function initAuthUi() {
+  try {
+    const r = await fetch("/api/auth-status");
+    const s = await r.json();
+    const f = $("logoutForm");
+    if (f && s.enabled) f.hidden = false;
+  } catch (e) { /* older backend without auth: nothing to show */ }
+})();
+
 async function loadHealthHistory(sessionId) {
   try {
     const q = sessionId ? `session_id=${encodeURIComponent(sessionId)}` : "";
     const res = await fetch(`/api/health-history?limit=500&${q}`);
+    if (res.status === 401) { goToLogin(); return; }
     const body = await res.json();
     healthHistory = body.events || [];
     renderHealthHistory();
@@ -64,21 +81,38 @@ async function loadHealthHistory(sessionId) {
   }
 }
 
-function connect() {
+function connect(isRetry = false) {
   const speed = $("speedSelect").value;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const url = `${proto}://${location.host}${WS_PATH}?speed=${speed}`;
 
   userClosed = false;
-  cancelRetry();
+  // A manual Connect starts the backoff from scratch; an automatic retry
+  // must keep its attempt count, or an unreachable robot would be retried
+  // every second forever.
+  if (isRetry) {
+    if (retryCountdown) { clearInterval(retryCountdown); retryCountdown = null; }
+  } else {
+    cancelRetry();
+  }
   setConnPill("connecting");
   ws = new WebSocket(url);
 
   ws.onopen = () => {
-    retryAttempt = 0;
-    cancelRetry();
+    loadAcks();
+    // retryAttempt is reset on the first "meta" (= the backend really
+    // reached the robot), not here: the WebSocket to OUR backend can open
+    // fine while the robot behind it is unreachable, and resetting here
+    // would retry that forever at full speed instead of backing off.
+    // (So only the pending timers are cleared here, not the attempt count -
+    // cancelRetry() would reset it too.)
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    if (retryCountdown) { clearInterval(retryCountdown); retryCountdown = null; }
     connectedAt = Date.now();
-    setConnPill("online");
+    // Our backend answered; "Connected" waits for the first meta, i.e.
+    // for the backend to actually reach the robot.
+    setConnPill("connecting");
+    setConnLabel("Reaching robot…");
     setAvail("3d", "online");
     $("connectBtn").disabled = true;
     $("disconnectBtn").disabled = false;
@@ -95,6 +129,9 @@ function connect() {
       return;
     }
     if (msg.type === "meta") {
+      retryAttempt = 0;
+      lastBackendError = null;
+      setConnPill("online");
       meta = msg;
       // A brand-new WebSocket connection = a brand-new session_id from
       // the backend. Re-scope the Event History panel to THIS session
@@ -133,11 +170,18 @@ function connect() {
     } else if (msg.type === "eof") {
       setConnLabel("End of recording");
     } else if (msg.type === "error") {
+      // e.g. "Could not reach the robot at 10.0.0.5:9090" or "Robot address
+      // changed ... reconnecting": shown in the link-lost banner, not only
+      // in the console, so the operator knows WHY there is no data.
       console.error("backend error:", msg.message);
+      lastBackendError = msg.message;
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
+    // 1008 = policy violation: the backend refused the stream because the
+    // login session is missing or expired. Retrying would only loop.
+    if (ev && ev.code === 1008) { userClosed = true; disconnect("closed"); goToLogin(); return; }
     if (userClosed) { disconnect("closed"); return; }
     // Unexpected drop (robot link, rosbridge restart, network blip,
     // server restart): full local reset (same as a manual disconnect -
@@ -147,15 +191,22 @@ function connect() {
     scheduleRetry();
   };
   ws.onerror = () => {
-    if (userClosed) { disconnect("error"); return; }
+    // An error is always followed by "close", whose handler schedules the
+    // retry - scheduling here too would count one failure twice.
     disconnect("error");
-    scheduleRetry();
   };
 }
 
 function disconnect(reason) {
   if (reason === "user") userClosed = true;
-  cancelRetry();
+  // Only a user disconnect resets the backoff; a drop keeps counting so
+  // repeated failures (robot unreachable) back off 1, 2, 4 ... s and stop
+  // after RETRY_MAX instead of hammering every second forever.
+  if (reason === "user") cancelRetry();
+  else {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    if (retryCountdown) { clearInterval(retryCountdown); retryCountdown = null; }
+  }
   if (ws) {
     try { ws.close(); } catch (e) {}
     ws = null;
@@ -179,13 +230,15 @@ function setConnPill(state, label) {
   // never for a user-initiated disconnect.
   const banner = $("dropBanner");
   if (banner) {
-    banner.hidden = !(state === "retrying" || state === "failed");
+    // Also kept up while a retry is connecting after a backend error, so
+    // the reason ("Could not reach the robot at ...") doesn't flicker.
+    banner.hidden = !(state === "retrying" || state === "failed" || (state === "connecting" && lastBackendError));
     const last = $("drop-last");
     if (last) last.textContent = lastDataWall ? new Date(lastDataWall).toLocaleTimeString() : "—";
     const hint = $("drop-hint");
     if (hint) hint.textContent = state === "failed"
-      ? "Retries exhausted · check backend (uvicorn :8123) and rosbridge :9090, then press Connect"
-      : `Reconnecting automatically · ${label || ""}`;
+      ? `${lastBackendError ? lastBackendError + " · " : ""}Retries exhausted · check the robot address in Settings, then press Connect`
+      : `${lastBackendError ? lastBackendError + " · " : ""}Reconnecting automatically${state === "connecting" ? " · trying now…" : " · " + (label || "")}`;
   }
   if (state === "online") {
     pill.classList.add("online");
@@ -213,6 +266,7 @@ function setConnLabel(text) { $("connLabel").textContent = text; }
 // Telemetry resets fully on every drop (same as manual disconnect) -
 // predictable beats clever here; availability goes stale naturally.
 let userClosed = false;
+let lastBackendError = null;  // last {"type":"error"} from the backend, shown in the drop banner
 let retryAttempt = 0;
 let retryTimer = null;
 let retryCountdown = null;
@@ -251,7 +305,7 @@ function scheduleRetry() {
   }, 1000);
   retryTimer = setTimeout(() => {
     retryTimer = null;
-    if (!userClosed) connect();
+    if (!userClosed) connect(true);
   }, wait * 1000);
 }
 
@@ -349,6 +403,7 @@ function clearAllTelemetry() {
   if (nmea) nmea.textContent = "--";
   activeHealth.clear();
   ackKeys.clear();
+  ackInfo.clear();
   selectedAlert = null;
   showAlertDetail(null);
   timelineSamples.length = 0;
@@ -606,7 +661,7 @@ function renderHealthBanner() {
       <span class="hl-dot"></span>
       <span class="hl-signal">${escapeHtml(e.signal)}</span>
       <span class="hl-msg">${escapeHtml(e.message)}</span>
-      ${ackKeys.has(e.key) ? '<span class="ack-tag">ACK</span>' : ""}
+      ${ackKeys.has(e.key) ? `<span class="ack-tag" title="${escapeHtml(ackTitle(e.key))}">ACK${ackInfo.get(e.key)?.acked_by ? " · " + escapeHtml(ackInfo.get(e.key).acked_by) : ""}</span>` : ""}
     </li>
   `).join("");
   const nAck = events.filter(e => ackKeys.has(e.key)).length;
@@ -984,6 +1039,7 @@ const DETECTORS = [
   { label: "Sensor liveness", kinds: ["sensor_health", "sensor_failure"], hint: "frozen / dead fields" },
   { label: "Topic comms", kinds: ["comms"], hint: "stale streams" },
   { label: "Failure escalation", kinds: ["failure"], hint: "persistent → capability lost" },
+  { label: "Security watch", kinds: ["security"], hint: "unknown clients, forged commands, new topics" },
 ];
 
 function renderDetectors(events, live) {
@@ -1139,7 +1195,7 @@ const KIND_LABEL = {
   hardware_fault: "Controller fault (Roboteq bitmask)", statistical: "Statistical baseline (rolling z-score)",
   residual: "Command vs. measured speed", gnss: "GNSS positioning", ml: "ML ensemble (Isolation Forest + Autoencoder)",
   sensor_health: "Sensor liveness (suspected)", sensor_failure: "Sensor liveness (proven dead)",
-  comms: "Topic communications", failure: "Failure escalation",
+  comms: "Topic communications", failure: "Failure escalation", security: "Security watch",
 };
 const FAULT_ACTIONS = {
   UNDERVOLTAGE: ["Controller supply voltage fell below its limit - compare with the battery voltage: if the battery is fine, the problem is on the power path.",
@@ -1175,11 +1231,30 @@ const KIND_GUIDE = {
     act: ["Check the publishing node (rosnode list / rostopic hz) and rosbridge.", "Run the network speed test: good network + no data = ROS side; bad network = link (RV55 / Ethernet)."] },
   ml: { means: "The Isolation Forest and/or Autoencoder found the joint pattern of currents and voltage drops unlike normal operation. 'Largest deviation' points at the most unusual signal.",
     act: ["Check the subsystem named in 'largest deviation' (vdrop = controller supply minus battery voltage).", "Look at rule alerts active at the same time (grouped incident) to confirm."] },
+  security: { means: "Security watch flagged activity that does not match normal operation of the robot's ROS network.",
+    act: ["Treat as a possible intrusion until explained.", "Check the robot's network (router RV55 client list) for unknown devices."] },
   failure: { means: "A problem persisted long enough to claim that a core capability of the robot is impaired.",
     act: ["Treat the capability below as unavailable: pause or abort the mission.", "Dispatch maintenance with this report (Export HTML)."] },
 };
 
+const SECURITY_GUIDE = {
+  "security:client:": { means: "A device that is not the dashboard opened a connection to the robot's rosbridge. rosbridge has no password: this client can read every sensor and publish motor commands.",
+    act: ["Identify the IP (router RV55 DHCP leases / ARP table). Is it a known engineer laptop or tool (Foxglove)?",
+          "If unknown: unplug or block it at the router, and keep the robot stopped until checked.",
+          "Long term: restrict port 9090 to trusted IPs (firewall) and enable rosbridge authentication."] },
+  "security:cmd:": { means: "A motor command exceeds any speed the drivetrain was ever measured reaching. Either the planner is faulty or a command was injected/forged on the ROS network.",
+    act: ["Stop the robot (E-stop) and check what it is actually doing.",
+          "Find the publisher of the command topic (rostopic info /<side>/<pos>/cmd) - more than the expected node = injection.",
+          "Check the 'rosbridge client' alerts: an unknown client often comes first."] },
+  "security:topic:": { means: "A topic appeared that did not exist when the session started - a new publisher joined the robot's ROS network.",
+    act: ["Find who publishes it (rostopic info <topic>).", "If it is not a known node restart, treat as an intrusion attempt and check connected clients."] },
+};
+
 function alertGuidance(ev) {
+  if (ev.kind === "security") {
+    const pfx = Object.keys(SECURITY_GUIDE).find(p => (ev.key || "").startsWith(p));
+    if (pfx) return { means: SECURITY_GUIDE[pfx].means, act: SECURITY_GUIDE[pfx].act.slice() };
+  }
   const base = KIND_GUIDE[ev.kind] || { means: "Event raised by the health monitor.", act: ["Check the raw message below."] };
   let act = base.act.slice();
   const src = ev.kind === "failure" ? (activeHealth.get(parentKey(ev.key)) || ev) : ev;
@@ -1208,7 +1283,8 @@ function showAlertDetail(ev) {
   const when = ev.logged_at ? fmtClock(ev.logged_at) : "";
   $("ad-meta").textContent = `${active ? "ACTIVE" : (ev.state === "cleared" ? "CLEARED" : "NOT ACTIVE")}${when ? " · " + when : ""} · key ${ev.key}`;
   $("ad-kind").textContent = KIND_LABEL[ev.kind] || ev.kind;
-  $("ad-cap").textContent = ev.capability ? (CAPABILITY_LABEL[ev.capability] || ev.capability) : "none claimed";
+  $("ad-cap").textContent = ev.capability ? (CAPABILITY_LABEL[ev.capability] || ev.capability)
+    : (ev.kind === "security" ? "Robot integrity (possible intrusion)" : "none claimed");
   const g = alertGuidance(ev);
   $("ad-means").textContent = g.means;
   $("ad-action").innerHTML = g.act.map(a => `<li>${escapeHtml(a)}</li>`).join("");
@@ -1217,7 +1293,7 @@ function showAlertDetail(ev) {
   if (btn) {
     btn.hidden = !active;
     const acked = ackKeys.has(ev.key);
-    btn.textContent = acked ? "✓ Acknowledged — click to undo" : "Acknowledge (operator has seen it)";
+    btn.textContent = acked ? `✓ ${ackTitle(ev.key)} — click to undo` : "Acknowledge (operator has seen it)";
     if (btn.classList) btn.classList.toggle("acked", acked);
   }
 }
@@ -1242,13 +1318,42 @@ function selectAlert(ev) {
     const ev = healthHistory[Number(li.dataset.hidx)];
     if (ev) selectAlert(activeHealth.get(ev.key) && ev.state === "new" ? activeHealth.get(ev.key) : ev);
   });
-  if (btn && btn.addEventListener) btn.addEventListener("click", () => {
+  if (btn && btn.addEventListener) btn.addEventListener("click", async () => {
     if (!selectedAlert || !activeHealth.has(selectedAlert.key)) return;
-    if (ackKeys.has(selectedAlert.key)) ackKeys.delete(selectedAlert.key); else ackKeys.add(selectedAlert.key);
-    showAlertDetail(selectedAlert);
-    renderHealthBanner();
+    const ev = selectedAlert;
+    btn.disabled = true;
+    try {
+      const res = ackKeys.has(ev.key)
+        ? await fetch("/api/acks/" + encodeURIComponent(ev.key), { method: "DELETE" })
+        : await fetch("/api/acks", { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: ev.key, kind: ev.kind, severity: ev.severity, signal: ev.signal, message: ev.message }) });
+      if (res.status === 401) { goToLogin(); return; }
+    } catch (e) { /* offline: state below stays as the server last said */ }
+    finally { btn.disabled = false; }
+    await loadAcks();
   });
 })();
+
+// ---------- acknowledgements: stored server-side, shared between operators ----------
+function ackTitle(key) {
+  const a = ackInfo.get(key);
+  if (!a) return "Acknowledged";
+  return `Acknowledged${a.acked_by ? " by " + a.acked_by : ""}${a.acked_at ? " at " + fmtClock(a.acked_at) : ""}`;
+}
+
+async function loadAcks() {
+  try {
+    const res = await fetch("/api/acks");
+    if (res.status === 401) { goToLogin(); return; }
+    const body = await res.json();
+    ackKeys.clear(); ackInfo.clear();
+    for (const a of body.open || []) { ackKeys.add(a.alert_key); ackInfo.set(a.alert_key, a); }
+  } catch (e) { return; }
+  renderHealthBanner();
+  if (selectedAlert) showAlertDetail(selectedAlert);
+}
+// Another operator's ack shows up here within a few seconds.
+setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) loadAcks(); }, 4000);
 
 // ---------- robot state timeline (last 10 min, 1 sample/s) ----------
 const TIMELINE_N = 600;

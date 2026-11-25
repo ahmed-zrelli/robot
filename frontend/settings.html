@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PGuard — Settings</title>
+<link rel="icon" href="assets/enova.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><img src="assets/enova.png" alt="Enova Robotics"><span class="tagline">Robots For a Safer World</span></a>
+  <div class="title-block">
+    <h1>PGuard — Settings</h1>
+    <span class="subtitle">Accounts · Access lists · Robot · Policy · Audit log</span>
+  </div>
+  <div class="conn-controls">
+    <span class="chip-box"><span class="mono dim">Signed in as <b id="me" class="teal">—</b></span></span>
+    <a class="export-btn ghost" href="/">← Back to dashboard</a>
+    <form id="logoutForm" method="post" action="/logout" hidden><button type="submit" class="ghost-btn logout-btn">Sign out</button></form>
+  </div>
+</header>
+
+<main class="settings-main">
+  <div id="flash" class="flash" hidden></div>
+  <div id="openWarn" class="flash warn" hidden>No operator account exists yet: the dashboard is <b>open to anyone</b> who can reach it. Create the first account below to turn on the login.</div>
+  <div id="weakWarn" class="flash warn" hidden>Your password does not meet the policy (it was set before the policy existed). Please change it below.</div>
+
+  <div class="grid">
+    <!-- MY ACCOUNT -->
+    <section class="panel set-panel" id="myAccount">
+      <div class="panel-head"><span class="panel-title">My account — change password</span></div>
+      <form id="pwForm" class="set-form">
+        <label>Current password<input type="password" id="pwCurrent" autocomplete="current-password" required></label>
+        <label>New password<input type="password" id="pwNew" autocomplete="new-password" required></label>
+        <label>Repeat new password<input type="password" id="pwNew2" autocomplete="new-password" required></label>
+        <div class="hint" id="policyHint"></div>
+        <button class="primary" type="submit">Change password</button>
+      </form>
+    </section>
+
+    <!-- USERS -->
+    <section class="panel set-panel">
+      <div class="panel-head"><span class="panel-title">Operator accounts</span><span class="count-badge" id="userCount">0</span></div>
+      <table class="set-table"><thead><tr><th>Username</th><th>Created</th><th>By</th><th></th></tr></thead><tbody id="userRows"></tbody></table>
+      <form id="userForm" class="set-form inline">
+        <input id="newUser" placeholder="username" autocomplete="off" required>
+        <input id="newUserPw" type="password" placeholder="initial password" autocomplete="new-password" required>
+        <button class="primary" type="submit">Add account</button>
+      </form>
+      <div class="hint">Passwords are stored only as salted PBKDF2-SHA256 hashes. Deleting an account ends its open sessions.</div>
+    </section>
+
+    <!-- DASHBOARD ACCESS -->
+    <section class="panel set-panel wide">
+      <div class="panel-head"><span class="panel-title">Dashboard access — computers allowed to open this dashboard</span><span class="count-badge" id="dashIpCount">0</span></div>
+      <div class="hint" id="dashIpMode"></div>
+      <table class="set-table"><thead><tr><th>IP or network</th><th>Label</th><th>Added</th><th>By</th><th></th></tr></thead><tbody id="dashIpRows"></tbody></table>
+      <form id="dashIpForm" class="set-form inline">
+        <input id="newDashIp" placeholder="IP or network, e.g. 192.168.1.20 or 192.168.1.0/24" autocomplete="off" required>
+        <input id="newDashIpLabel" placeholder="label, e.g. control-room PC" maxlength="60">
+        <button class="primary" type="submit">Allow</button>
+      </form>
+      <div class="hint">Computers not on this list get a blank “Not Found” page instead of the login page: they cannot try passwords and are not even told a dashboard exists here. Each blocked attempt is logged. This PC (127.0.0.1) is always allowed, and a change that would lock out your own computer is refused.</div>
+    </section>
+
+    <!-- TRUSTED IPS -->
+    <section class="panel set-panel wide">
+      <div class="panel-head"><span class="panel-title">Security watch — machines trusted to connect to the robot (rosbridge)</span><span class="count-badge" id="ipCount">0</span></div>
+      <div class="hint" id="ipMode"></div>
+      <table class="set-table"><thead><tr><th>IP address</th><th>Label</th><th>Added</th><th>By</th><th></th></tr></thead><tbody id="ipRows"></tbody></table>
+      <form id="ipForm" class="set-form inline">
+        <input id="newIp" placeholder="IP address, e.g. 172.28.0.1" autocomplete="off" required>
+        <input id="newIpLabel" placeholder="label, e.g. dashboard backend" maxlength="60">
+        <button class="primary" type="submit">Add trusted IP</button>
+      </form>
+      <div class="hint">Any client connected to the robot's rosbridge whose IP is not in this list raises a critical alert. Changes apply immediately, without reconnecting.</div>
+    </section>
+    <!-- ROBOT CONNECTION -->
+    <section class="panel set-panel" id="robotPanel">
+      <div class="panel-head"><span class="panel-title">Robot connection (rosbridge)</span><span class="count-badge" id="robotSource">—</span></div>
+      <div class="hint" id="robotNow"></div>
+      <form id="robotForm" class="set-form">
+        <label>Robot address (IP or host name)<input id="robotHost" placeholder="e.g. 192.168.1.50" autocomplete="off" required></label>
+        <div class="set-row">
+          <label>rosbridge port<input id="robotPort" type="number" min="1" max="65535" required></label>
+          <label>Speed-test port<input id="robotStPort" type="number" min="1" max="65535" required></label>
+        </div>
+        <div class="set-row btns">
+          <button class="ghost-btn" type="button" id="robotTest">Test connection</button>
+          <button class="primary" type="submit">Save &amp; reconnect</button>
+          <button class="ghost-btn" type="button" id="robotReset">Use default</button>
+        </div>
+        <div id="robotTestResult" class="hint"></div>
+      </form>
+      <div class="hint">Saving switches every open dashboard to the new robot: they reconnect by themselves within a few seconds. Test first — an address that does not answer leaves the dashboards without data. Every change is recorded in the audit log.</div>
+    </section>
+
+    <!-- POLICY -->
+    <section class="panel set-panel" id="policyPanel">
+      <div class="panel-head"><span class="panel-title">Security policy</span></div>
+      <form id="policyForm" class="set-form"><div id="policyRows" class="policy-grid"></div>
+        <button class="primary" type="submit">Save policy</button></form>
+      <div class="hint">Each value has a safe range: the policy can be tightened but never weakened below its floor (for example, passwords shorter than 8 characters are impossible). Login values apply to the next login attempt; Security watch values apply immediately.</div>
+    </section>
+
+    <!-- AUDIT LOG -->
+    <section class="panel set-panel wide" id="auditPanel">
+      <div class="panel-head"><span class="panel-title">Audit log — who did what, from where</span><span class="count-badge" id="auditCount">0</span></div>
+      <div class="audit-bar">
+        <span id="auditIntegrity" class="integrity">checking…</span>
+        <label class="audit-filter"><input type="checkbox" id="auditWarnOnly"> warnings only</label>
+        <button class="ghost-btn" id="auditRefresh" type="button">Refresh</button>
+      </div>
+      <div class="audit-scroll"><table class="set-table"><thead><tr><th>Time</th><th>Event</th><th>User</th><th>IP</th><th>Detail</th></tr></thead><tbody id="auditRows"></tbody></table></div>
+      <div class="hint">Logins, failed logins, lockouts, blocked computers, account and list changes, and alert acknowledgements. The log is append-only (nothing in the app can edit or delete it) and every row carries a SHA-256 hash of the previous one, so editing or deleting any past row in the database is detected here.</div>
+    </section>
+  </div>
+</main>
+<script src="settings.js"></script>
+</body>
+</html>

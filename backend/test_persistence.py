@@ -5,6 +5,8 @@ backend/:  python -m unittest test_persistence -v
 """
 import unittest
 
+import _testdb  # noqa: F401  (must precede main/db: throwaway DB)
+
 from main import _db_write_due, BAG_DB_WRITE_EVERY_S
 
 

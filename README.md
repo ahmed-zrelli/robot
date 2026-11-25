@@ -39,9 +39,11 @@ docker compose exec virtual-robot bash   # poke around inside (rostopic list, ro
 ```
 
 No `TELEMETRY_SOURCE` set = live mode. Set `TELEMETRY_SOURCE=bag` explicitly
-for offline replay. `ROSBRIDGE_HOST` / `ROSBRIDGE_PORT` (default localhost:9090)
-point live mode anywhere — same vars reach the real robot later, no code change.
-`SPEEDTEST_HOST` / `SPEEDTEST_PORT` (default 8091) idem for the speed test.
+for offline replay. **Robot address**: Settings → *Robot connection* (stored in
+the DB; *Test connection* checks the port first; *Save & reconnect* switches
+every open dashboard live). Without a saved value, `ROSBRIDGE_HOST` /
+`ROSBRIDGE_PORT` are used, then localhost:9090. `SPEEDTEST_PORT` (default 8091)
+idem for the speed test; `SPEEDTEST_HOST` pins it to another machine.
 
 ## Train / re-train the ML models
 
@@ -60,7 +62,7 @@ Artifacts: `scaler.pkl`, `if_model.pkl`, `ae_model.pt`, `ae_model.onnx`,
 
 ```bash
 cd backend
-python -m unittest test_infer test_schema_contract test_persistence test_health_monitor   # fast suite (~10s)
+python -m unittest test_infer test_schema_contract test_persistence test_health_monitor test_auth   # fast suite (~15s; test_auth needs httpx)
 
 $env:PGUARD_GOLDEN = '1'
 python -m unittest test_health_monitor.TestGoldenReplay    # full-bag replay (~15 min)
@@ -70,6 +72,70 @@ python -m unittest test_health_monitor.TestGoldenReplay    # full-bag replay (~1
 node --check frontend/app.js
 node scratch/test_frontend_logic.cjs        # history grouping/filter rules
 ```
+
+## Security (four layers - defense in depth)
+
+rosbridge has no authentication: anything that reaches port 9090 can read every
+topic and publish motor commands. Four independent layers:
+
+| Layer | Where | How to use |
+|---|---|---|
+| **rosbridge firewall** (prevention) | `virtual_robot/entrypoint.sh` | On by default in `docker-compose.yml`: only the Docker gateway (= the backend) may reach `:9090`. Open it for debugging with `$env:ROSBRIDGE_ALLOWED_SOURCES = ""` before `docker compose up`. On the real robot this is a router/firewall rule. |
+| **Security watch** (detection) | `backend/health_monitor.py` (kind `security`) | Always on in live mode: unknown rosbridge client, motor command above 240 rad/s (data-derived: never reached in the reference bag), topic appearing mid-session. **Who is trusted** (priority order): the trusted-IP list on the **Settings** page (stored in the DB, applies immediately) → `SECURITY_TRUSTED_IPS=ip1,ip2` → clients connected at session start (automatic; trusts an attacker already connected, so configure a list). |
+| **Dashboard access list** (prevention) | `backend/auth.py` (`require_login`), Settings → *Dashboard access* | Which **computers** may open the dashboard (single IPs or networks like `192.168.1.0/24`, stored in the DB). Others get a **bare `Not Found` (404) on every path** - no login page, no branding, nothing revealing a dashboard exists; the WebSocket handshake is refused without reason. Logged server-side. Empty list = everyone reaches the login page. `127.0.0.1` is always allowed (recovery), and a change that would exclude your own computer is refused. Only matters once the backend listens on the network (`--host 0.0.0.0`); by default it listens on `127.0.0.1` only. Note: Docker Desktop relays containers on the same PC through `127.0.0.1`, so they count as local. |
+| **Dashboard login** (prevention) | `backend/auth.py`, `frontend/settings.html` | Operator **accounts in the DB** (table `users`, PBKDF2-SHA256 600k iterations, per-user salt - no plaintext). Manage them on **Settings** (top-right of the dashboard): change password, add/delete accounts. No account = open dashboard (first run): create the first one in Settings. One-time migration: if no account exists and `DASHBOARD_PASSWORD` is set, an `admin` account is created from it at startup; the variable is ignored afterwards. Protects page, API, reports, Settings and the WebSocket. |
+
+**Security policy** - Settings → *Security policy*, stored in the DB
+(`settings` table, rules in `backend/policy.py`): failed logins before lockout
+(5), counting window (300 s), lockout (60 s), session length (8 h), minimum
+password length (8), Security-watch max motor command (240 rad/s) and alert
+hold (60 s). Each has hard bounds - the policy can be tightened but never
+weakened below its floor; out-of-range values are refused, never clamped, and
+one bad value refuses the whole save. PBKDF2 iterations and the detection
+thresholds pinned by the golden test stay in code on purpose.
+
+**Audit log** (traceability) - `backend/db.py` `audit_log`, Settings → *Audit log*:
+logins, failed logins, lockouts, blocked computers (max one row per IP per
+minute), password/account/list changes, alert acks, server starts - with user,
+IP and time. Passwords are never logged. Append-only from the app, and
+hash-chained (each row stores SHA-256 of the previous row's hash + its own
+fields): the panel re-verifies the whole chain and names the first edited or
+deleted row. Limit: someone with write access to the DB file could recompute
+the chain - an HMAC key kept outside the DB would close that.
+
+**Alert acknowledgements** are stored in the DB (`alert_acks`) with the
+operator's name, time and IP, shared by every open dashboard (`/api/acks`,
+polled every 4 s), and close automatically when the alert clears. When the last
+dashboard showing an alert disconnects, its ack closes after 150 s unless a
+connection re-detects it (a reload keeps the ack; a frozen sensor takes ~75 s
+to re-detect). A backend restart closes all open acks.
+
+Demo (virtual robot only - it publishes a forged motor command):
+
+```bash
+$env:ROSBRIDGE_ALLOWED_SOURCES = ""; docker compose up -d --force-recreate virtual-robot   # firewall OFF
+docker compose --profile attack run --rm attacker        # alerts fire in the dashboard
+Remove-Item Env:ROSBRIDGE_ALLOWED_SOURCES; docker compose up -d --force-recreate virtual-robot   # firewall ON (default)
+docker compose --profile attack run --rm attacker        # "BLOCKED - Connection refused"
+```
+
+Opening the dashboard to the network (e.g. control-room PCs), the hardened way:
+
+```powershell
+# 1. In Settings -> Dashboard access, add the allowed PCs/network FIRST (from this PC).
+# 2. Start without the "server: uvicorn" fingerprint header:
+python -m uvicorn main:app --host 0.0.0.0 --port 8123 --no-server-header
+# 3. Make the port not answer AT ALL for everyone else (OS firewall, admin PowerShell):
+New-NetFirewallRule -DisplayName "PGuard dashboard" -Direction Inbound -Protocol TCP -LocalPort 8123 -RemoteAddress 192.168.1.0/24 -Action Allow
+```
+
+The app can only answer blocked computers with a bare 404; the firewall rule is
+what makes the port silent (same idea as the iptables rule on the robot).
+
+Not covered yet (production): TLS (`https`/`wss`), rosauth, admin/operator
+roles, an HMAC key for the audit chain, and blocking - not just detecting -
+forged commands on the robot. Tests use a throwaway DB (`test_auth.py`); set
+`PGUARD_DB_PATH` to run a deployment on its own database file.
 
 ## Real robot — connecting (wired Ethernet, on-site)
 

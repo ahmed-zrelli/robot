@@ -232,6 +232,7 @@ starts - consistent with the rest of the project's "no persistence in V0
 beyond the DB" scope.
 """
 import math
+import os
 import sys
 from collections import deque, defaultdict
 from pathlib import Path
@@ -374,6 +375,34 @@ STALE_SCOPE = "all"   # "all" | "cmd"
 COMMS_EXEMPT_TOPICS = frozenset({
     "/rosout", "/rosout_agg", "/client_count", "/connected_clients",
 })
+
+# ---------- Security watch (kind "security") ----------
+# Detection, not prevention: the dashboard is read-only, so these checks
+# raise alerts the operator acts on. Three signals:
+#  1. unknown rosbridge client - rosbridge publishes every connected client's
+#     IP on /connected_clients (latched). Trusted = SECURITY_TRUSTED_IPS from
+#     the environment if set, else the IPs present in the FIRST snapshot this
+#     session sees (the dashboard's own connection). Note the limit: a client
+#     behind the same NAT/gateway as the dashboard shares its IP and cannot
+#     be told apart by IP alone.
+#  2. out-of-envelope motor command - |commanded_velocity| above any speed
+#     the drivetrain was ever MEASURED reaching. Data-derived, not invented:
+#     over the full 3.5 h reference bag the largest command was 212.2 rad/s
+#     and the fastest measured wheel 233.3 rad/s; 240 is the first round
+#     value above both. A command outside that envelope is either a fault in
+#     the planner or an injected/forged command.
+#  3. topic that appears mid-session - a publisher that was not there when
+#     the session started (e.g. an attacker advertising /cmd_hack).
+SECURITY_TRUSTED_IPS_ENV = "SECURITY_TRUSTED_IPS"
+SECURITY_MAX_CMD_RAD_S = 240.0
+# An injected command is an incident, not a state: on the first live demo
+# the legitimate planner's next in-range command arrived milliseconds after
+# each forged one, so a clear-on-next-normal-value alert flickered
+# new->cleared five times and was never visible. The alert now holds until
+# no out-of-envelope command has been seen for this long.
+SECURITY_CMD_HOLD_S = 60.0
+SECURITY_CLIENTS_TOPIC = "/connected_clients"
+SECURITY_IGNORED_NEW_TOPICS = COMMS_EXEMPT_TOPICS | {"/rosapi/topics"}
 
 # Fields known-absent for the reference hardware/message variant - excluded
 # from field_coverage_warnings() so that log line keeps meaning "a NEW
@@ -561,7 +590,16 @@ class RollingStat:
 
 
 class HealthMonitor:
-    def __init__(self):
+    def __init__(self, trusted_ips_provider=None, security_limits_provider=None):
+        # trusted_ips_provider: callable returning the operator-managed
+        # trusted-IP set (main.py passes db.trusted_ip_set, edited from the
+        # Settings page). Queried on every /connected_clients update, so a
+        # change applies without reconnecting. None/empty -> fallbacks below.
+        self._trusted_ips_provider = trusted_ips_provider
+        # security_limits_provider: callable -> (max_cmd_rad_s, cmd_hold_s),
+        # the Settings-page policy (main.py). None = the validated defaults
+        # (SECURITY_MAX_CMD_RAD_S / SECURITY_CMD_HOLD_S) - tests and replays.
+        self._security_limits_provider = security_limits_provider
         self._stats = defaultdict(RollingStat)
         self._active = {}              # event key -> event dict, currently active only
         self._anom_since = defaultdict(lambda: None)   # key -> t anomaly run started
@@ -588,6 +626,12 @@ class HealthMonitor:
         self._topic_intervals = defaultdict(lambda: deque(maxlen=50))  # topic -> recent inter-arrival gaps
         self._topic_msg_count = defaultdict(int)      # topic -> messages seen (for coverage check)
         self._field_valid_count = defaultdict(int)    # (topic, field) -> times seen as a valid number
+        # Security watch state (see SECURITY_* constants)
+        env_ips = os.environ.get(SECURITY_TRUSTED_IPS_ENV, "")
+        self._env_trusted_ips = {ip.strip() for ip in env_ips.split(",") if ip.strip()}
+        self._baseline_ips = None      # first /connected_clients snapshot (last-resort fallback)
+        self._topic_baseline = None    # topics present at session start (live mode)
+        self._last_bad_cmd = {}        # security:cmd:<motor> -> t of last out-of-envelope command
 
     def _is_driving(self):
         """True if any motor's last-known commanded_velocity is nonzero.
@@ -746,8 +790,97 @@ class HealthMonitor:
         events += self._check_velocity_residual(topic, data, t)
         events += self._check_gnss_fix(topic, data, t)
         events += self._check_ml(topic, data, t)
+        events += self._check_security_clients(topic, data, t)
+        events += self._check_security_command(topic, data, t)
         events += self._check_failure_escalation(t)
         return events
+
+    # ---------- security watch ----------
+    def _check_security_clients(self, topic, data, t):
+        """Unknown rosbridge client (see SECURITY_* constants, signal 1)."""
+        if topic != SECURITY_CLIENTS_TOPIC:
+            return []
+        clients = data.get("clients") if isinstance(data, dict) else None
+        if not isinstance(clients, list):
+            return []
+        ips = {c.get("ip_address") for c in clients
+               if isinstance(c, dict) and isinstance(c.get("ip_address"), str)}
+        # Who is trusted, in priority order: the operator-managed list in
+        # the database (Settings page), then SECURITY_TRUSTED_IPS, then -
+        # only if neither is configured - whoever was connected at session
+        # start (the dashboard's own link). The last fallback trusts an
+        # attacker who was already connected, so configuring a list is
+        # the recommended setup.
+        managed = set(self._trusted_ips_provider() or ()) if self._trusted_ips_provider else set()
+        if managed:
+            trusted, basis = managed, "Settings list"
+        elif self._env_trusted_ips:
+            trusted, basis = self._env_trusted_ips, "SECURITY_TRUSTED_IPS"
+        else:
+            if self._baseline_ips is None:
+                self._baseline_ips = set(ips)  # first snapshot = this dashboard's own link
+                return []
+            trusted, basis = self._baseline_ips, "clients at session start"
+        out = []
+        unknown = ips - trusted
+        for ip in sorted(unknown):
+            key = f"security:client:{ip}"
+            if key not in self._active:
+                out.append(self._emit_new(
+                    key, "security", "critical", "rosbridge client",
+                    f"Unknown client {ip} connected to rosbridge (trusted per {basis}: "
+                    f"{', '.join(sorted(trusted)) or 'none'}) - "
+                    f"it can read every topic and publish commands", t))
+        for key in [k for k in self._active if k.startswith("security:client:")]:
+            if key[len("security:client:"):] not in unknown:
+                out.extend(self._emit_cleared(key))
+        return out
+
+    def _check_security_command(self, topic, data, t):
+        """Out-of-envelope motor command (see SECURITY_* constants, signal 2)."""
+        motor = CMD_MOTOR.get(topic)
+        if motor is None:
+            return []
+        cv = data.get("commanded_velocity")
+        if isinstance(cv, bool) or not isinstance(cv, (int, float)) or not math.isfinite(cv):
+            return []
+        key = f"security:cmd:{motor}"
+        max_cmd, hold_s = (self._security_limits_provider() if self._security_limits_provider
+                           else (SECURITY_MAX_CMD_RAD_S, SECURITY_CMD_HOLD_S))
+        if abs(cv) > max_cmd:
+            self._last_bad_cmd[key] = t
+            if key not in self._active:
+                return [self._emit_new(
+                    key, "security", "critical", f"{motor} command",
+                    f"Motor command {cv:.1f} rad/s outside the robot's operating envelope "
+                    f"(max {max_cmd:.0f} rad/s; fastest ever measured 233 rad/s) - "
+                    f"possible injected or corrupted command", t)]
+            return []
+        if key in self._active and t - self._last_bad_cmd.get(key, t) >= hold_s:
+            return self._emit_cleared(key)
+        return []
+
+    def set_topic_baseline(self, topics):
+        """Record the topics present when the live session started."""
+        self._topic_baseline = {t for t in topics if not t.startswith("/relay/")}
+
+    def check_new_topics(self, topics, t):
+        """Topic that appeared mid-session (see SECURITY_* constants, signal 3).
+        Called by main.py with the topics found by periodic re-discovery."""
+        if self._topic_baseline is None:
+            return []
+        out = []
+        for topic in topics:
+            if topic.startswith("/relay/") or topic in SECURITY_IGNORED_NEW_TOPICS:
+                continue
+            if topic in self._topic_baseline:
+                continue
+            self._topic_baseline.add(topic)
+            out.append(self._emit_new(
+                f"security:topic:{topic}", "security", "warning", "new ROS topic",
+                f"Topic {topic} appeared during the session (not present at start) - "
+                f"check which node publishes it (rostopic info {topic})", t))
+        return out
 
     def _emit_new(self, key, kind, severity, signal, message, t, capability=None):
         ev = {
